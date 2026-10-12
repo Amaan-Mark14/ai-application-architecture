@@ -22,7 +22,6 @@ from rag.test_doubles import DeterministicEmbeddingStub
 from rag.vector_index import InMemoryVectorIndex
 
 
-
 class TestRetriever(unittest.TestCase):
     """Test suite verifying semantic retrieval decoupled from LLM generation."""
 

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from .document import Chunk
 
@@ -33,8 +34,8 @@ class VectorIndexPort(Protocol):
         self,
         query_vector: Sequence[float],
         top_k: int = 5,
-        filters: Optional[Mapping[str, Any]] = None,
-    ) -> List[ScoredChunk]:
+        filters: Mapping[str, Any] | None = None,
+    ) -> list[ScoredChunk]:
         """Perform similarity search returning top-K scored chunks adhering to filters."""
         ...
 
@@ -79,9 +80,9 @@ class InMemoryVectorIndex(VectorIndexPort):
     Provides complete visibility into retrieval mechanics without external database dependencies.
     """
 
-    def __init__(self, dimensions: Optional[int] = None) -> None:
+    def __init__(self, dimensions: int | None = None) -> None:
         self.dimensions = dimensions
-        self._entries: List[Tuple[Chunk, List[float]]] = []
+        self._entries: list[tuple[Chunk, list[float]]] = []
 
     def add(self, chunk: Chunk, vector: Sequence[float]) -> None:
         vec_list = [float(x) for x in vector]
@@ -105,7 +106,7 @@ class InMemoryVectorIndex(VectorIndexPort):
         for chunk, vec in zip(chunks, vectors):
             self.add(chunk, vec)
 
-    def _matches_filters(self, chunk: Chunk, filters: Optional[Mapping[str, Any]]) -> bool:
+    def _matches_filters(self, chunk: Chunk, filters: Mapping[str, Any] | None) -> bool:
         """Check if chunk metadata satisfies all key-value filter conditions."""
         if not filters:
             return True
@@ -119,8 +120,8 @@ class InMemoryVectorIndex(VectorIndexPort):
         self,
         query_vector: Sequence[float],
         top_k: int = 5,
-        filters: Optional[Mapping[str, Any]] = None,
-    ) -> List[ScoredChunk]:
+        filters: Mapping[str, Any] | None = None,
+    ) -> list[ScoredChunk]:
         """Perform exact cosine similarity search with deterministic tie-breaking."""
         if top_k <= 0:
             raise ValueError(f"top_k must be positive, got {top_k}")
@@ -129,7 +130,7 @@ class InMemoryVectorIndex(VectorIndexPort):
                 f"Query vector dimension ({len(query_vector)}) does not match index dimension ({self.dimensions})"
             )
 
-        candidates: List[ScoredChunk] = []
+        candidates: list[ScoredChunk] = []
         for chunk, vec in self._entries:
             if not self._matches_filters(chunk, filters):
                 continue

@@ -24,9 +24,9 @@ from contracts.models import EmbeddingRequest
 from contracts.ports import EmbeddingPort, TextGenerationPort
 from ollama_adapter.adapter import OllamaAdapter
 from ollama_embedding_adapter.adapter import OllamaEmbeddingAdapter
+from rag.chunker import HeadingAwareChunker
 from rag.citation_validator import CitationValidator
 from rag.context_builder import ContextBuilder
-from rag.chunker import HeadingAwareChunker
 from rag.ingestion import load_corpus_directory
 from rag.retriever import Retriever
 from rag.service import RAGService
@@ -126,7 +126,7 @@ async def verify_rag_pipeline(
     print(f"Citations Verified: {[c.chunk_id for c in resp.citations]}")
     print(f"Latency: {resp.latency_ms:.1f}ms")
 
-    if not resp.citations or resp.insufficient_evidence:
+    if not resp.accepted or not resp.citations or resp.insufficient_evidence:
         print("FAIL: Smoke query failed to return verified citations.")
         return 1
 

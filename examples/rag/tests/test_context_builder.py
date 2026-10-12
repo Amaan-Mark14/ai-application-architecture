@@ -14,7 +14,7 @@ for p in (BUILDING_BLOCKS_DIR, RAG_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from rag.context_builder import EVIDENCE_FOOTER, EVIDENCE_HEADER, ContextBuilder
+from rag.context_builder import EVIDENCE_FOOTER, EVIDENCE_HEADER, TRUNCATION_MARKER, ContextBuilder
 from rag.document import Chunk
 from rag.retriever import RetrievalResult
 
@@ -75,6 +75,41 @@ class TestContextBuilder(unittest.TestCase):
         self.assertTrue(res.truncated)
         self.assertEqual(res.chunks_count, 1)
         self.assertEqual(res.included_chunk_ids, ["doc1#c0"])
+
+    def test_all_small_budgets_and_long_headers_remain_bounded(self) -> None:
+        chunk = Chunk("d" * 120, "doc", 0, "x" * 800, section_title="s" * 130)
+        results = [RetrievalResult(chunk, 1.0, 1)]
+        for budget in range(1, 850):
+            result = ContextBuilder(max_chars=budget).build_context(results)
+            self.assertLessEqual(len(result.formatted_context), budget)
+            self.assertEqual(result.total_chars, len(result.formatted_context))
+            if result.included_chunk_ids:
+                self.assertIn(TRUNCATION_MARKER, result.formatted_context)
+                self.assertTrue(result.formatted_context.endswith(EVIDENCE_FOOTER))
+
+    def test_exact_fit_and_one_character_less(self) -> None:
+        results = [RetrievalResult(self.chunk1, 1.0, 1)]
+        full = ContextBuilder().build_context(results)
+        exact = ContextBuilder(max_chars=full.total_chars).build_context(results)
+        self.assertEqual(exact, full)
+        smaller = ContextBuilder(max_chars=full.total_chars - 1).build_context(results)
+        self.assertLessEqual(smaller.total_chars, full.total_chars - 1)
+        self.assertTrue(smaller.truncated)
+
+    def test_literal_truncation_marker_is_ordinary_document_text(self) -> None:
+        chunk = Chunk("literal#c0", "literal", 0, "Literal example: " + TRUNCATION_MARKER)
+        result = ContextBuilder().build_context([
+            RetrievalResult(chunk, 1.0, 1), RetrievalResult(self.chunk1, 0.9, 2)
+        ])
+        self.assertEqual(result.chunks_count, 2)
+        self.assertFalse(result.truncated)
+
+    def test_empty_context_accounting_and_request_override(self) -> None:
+        self.assertEqual(ContextBuilder().build_context([]).total_chars, 28)
+        self.assertEqual(ContextBuilder(max_chars=1).build_context([]).total_chars, 0)
+        result = ContextBuilder().build_context([RetrievalResult(self.chunk1, 1.0, 1)], max_chars=1)
+        self.assertEqual(result.included_chunk_ids, [])
+        self.assertEqual(result.formatted_context, "")
 
 
 if __name__ == "__main__":

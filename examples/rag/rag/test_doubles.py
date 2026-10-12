@@ -6,7 +6,8 @@ import hashlib
 import json
 import math
 import re
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from collections.abc import Mapping
+from typing import Any
 
 from contracts.models import (
     CompletionRequest,
@@ -18,7 +19,6 @@ from contracts.models import (
 )
 from contracts.ports import EmbeddingPort, TextGenerationPort
 from contracts.telemetry import AiOperationContext
-
 
 STOP_WORDS = {
     "what", "is", "the", "for", "in", "to", "how", "a", "an", "and",
@@ -38,9 +38,9 @@ class DeterministicEmbeddingStub(EmbeddingPort):
 
     def __init__(self, dimensions: int = 512) -> None:
         self.dimensions = dimensions
-        self.recorded_requests: List[EmbeddingRequest] = []
+        self.recorded_requests: list[EmbeddingRequest] = []
 
-    def _compute_vector(self, text: str) -> List[float]:
+    def _compute_vector(self, text: str) -> list[float]:
         """Convert text into a normalized term and n-gram frequency vector."""
         words = [w for w in re.findall(r"\w+", text.lower()) if w not in STOP_WORDS]
         vec = [0.0] * self.dimensions
@@ -67,7 +67,7 @@ class DeterministicEmbeddingStub(EmbeddingPort):
     async def embed(
         self,
         request: EmbeddingRequest,
-        context: Optional[AiOperationContext] = None,
+        context: AiOperationContext | None = None,
     ) -> EmbeddingResponse:
         self.recorded_requests.append(request)
         embeddings = [self._compute_vector(t) for t in request.inputs]
@@ -85,8 +85,8 @@ class DeterministicRAGGenerationStub(TextGenerationPort):
 
     def __init__(
         self,
-        canned_answers: Optional[Mapping[str, Dict[str, Any]]] = None,
-        default_answer: Optional[Dict[str, Any]] = None,
+        canned_answers: Mapping[str, dict[str, Any]] | None = None,
+        default_answer: dict[str, Any] | None = None,
     ) -> None:
         self.canned_answers = dict(canned_answers) if canned_answers else {}
         self.default_answer = default_answer or {
@@ -94,12 +94,12 @@ class DeterministicRAGGenerationStub(TextGenerationPort):
             "citations": [],
             "insufficient_evidence": False,
         }
-        self.recorded_requests: List[CompletionRequest] = []
+        self.recorded_requests: list[CompletionRequest] = []
 
     async def generate(
         self,
         request: CompletionRequest,
-        context: Optional[AiOperationContext] = None,
+        context: AiOperationContext | None = None,
     ) -> CompletionResponse:
         self.recorded_requests.append(request)
 

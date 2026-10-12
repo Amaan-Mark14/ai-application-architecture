@@ -2,7 +2,7 @@
 
 ```text
 Phase:                  04 — AI Foundations
-Status:                 Frozen & Accepted
+Status:                 Implemented; metadata-only telemetry, Gate F unmet
 Learning Guide Status:  Complete
 Primary Audience:       AI Systems Architects, Senior Backend Engineers, Platform Engineers
 Implementation:         platform/ollama-adapter/, examples/structured-generation/, examples/ai-evaluation/, ADR-0003
@@ -11,6 +11,8 @@ Implementation:         platform/ollama-adapter/, examples/structured-generation
 ---
 
 ## 1. Phase Overview
+
+Phase 4 delivers model/latency/token metadata and correlation fields, not emitted OpenTelemetry spans. [ADR-0012](../../adr/0012-phase-4-telemetry-deferral-and-rag-preparation-cache.md) and [ROADMAP.md](../../ROADMAP.md) assign span implementation and local export verification to Phase 12. Gate F remains unmet for the Tier 3 adapter; the reconciled phase exit criteria do not certify full quality-gate acceptance.
 
 ### What Did This Phase Build?
 Phase 4 is the first operational AI implementation phase in the repository. It established a **small, production-conscious, provider-neutral AI foundation** consisting of:
@@ -517,7 +519,7 @@ Phase 4: AI Foundations
 5. *Answer*: High schema adherence on standard inputs does not prove safety. Adversarial scenarios verify that the system abstains on malicious instructions, resists prompt injections, and handles boundary inputs without crashing.
 6. *Answer*: To prevent automation and CI pipelines from misinterpreting missing infrastructure as successful passes. A failure or missing runtime must exit non-zero.
 7. *Answer*: Provider Portability is the ability to swap runtime vendors (Ollama, vLLM, Azure OpenAI) without changing application code. Model Portability is the ability of prompt templates and schemas to operate across different model families (Llama, Mistral, Claude) without prompt redesign.
-8. *Answer*: Decouples telemetry data collection from external observability infrastructure. Domain objects carry `trace_id` and `span_id` headers natively; exporting to Datadog, Prometheus, or Jaeger is an infrastructure detail wired later.
+8. *Answer*: Domain objects carry correlation fields without coupling to a telemetry SDK. Those fields do not create or emit spans. Phase 12 must implement spans and verify a local or in-memory exporter before Gate F can be satisfied; a hosted observability platform is unnecessary for that verification.
 
 ---
 

@@ -15,7 +15,7 @@ for p in (BUILDING_BLOCKS_DIR, RAG_DIR):
         sys.path.insert(0, str(p))
 
 from rag.chunker import HeadingAwareChunker
-from rag.document import Document, make_chunk_id
+from rag.document import Document
 from rag.ingestion import load_corpus_directory, normalize_text, parse_frontmatter
 
 
@@ -103,7 +103,51 @@ All passwords must be at least 16 characters in length.
         for c in chunks:
             self.assertEqual(c.document_id, "large-doc")
             self.assertTrue(c.chunk_id.startswith("large-doc#c"))
-            self.assertLessEqual(len(c.text), 450)  # bounded size
+            self.assertLessEqual(len(c.text), 300)
+
+    def test_long_paragraph_and_heading_prefix_obey_limit(self) -> None:
+        for heading in ("Section", "H" * 180):
+            body = "x" * 517
+            doc = Document("long", "Long", f"## {heading}\n\n{body}", "long.md")
+            chunks = HeadingAwareChunker(max_chunk_chars=100).chunk_document(doc)
+            self.assertTrue(all(len(chunk.text) <= 100 for chunk in chunks))
+            self.assertEqual(sum(chunk.text.count("x") for chunk in chunks), len(body))
+            self.assertTrue(all(chunk.section_title == heading for chunk in chunks))
+
+    def test_short_preamble_and_final_fragment_are_preserved(self) -> None:
+        doc = Document("short", "Short", "Intro.\n\n## Section\n\n" + "x" * 91, "short.md")
+        chunks = HeadingAwareChunker(max_chunk_chars=100).chunk_document(doc)
+        self.assertEqual(chunks[0].text, "Intro.")
+        self.assertEqual(sum(chunk.text.count("x") for chunk in chunks), 91)
+
+    def test_fenced_headings_are_inert_for_both_fence_styles(self) -> None:
+        for opener, closer in (("```python", "```"), ("~~~~", "~~~~"), ("````", "````")):
+            body = f"## Real\n\n{opener}\n## Fake\n```\n# Also Fake\n{closer}\n\n## Next\n\nEnd"
+            doc = Document("code", "Code", body, "code.md")
+            chunks = HeadingAwareChunker(max_chunk_chars=1000).chunk_document(doc)
+            # For the triple-backtick case the inner ``` legitimately closes the fence.
+            if opener == "```python":
+                body = "## Real\n\n```python\n## Fake\n~~~\n# Also Fake\n```\n\n## Next\nEnd"
+                chunks = HeadingAwareChunker(max_chunk_chars=1000).chunk_document(
+                    Document("code", "Code", body, "code.md")
+                )
+            self.assertEqual([chunk.section_title for chunk in chunks], ["Real", "Next"])
+            self.assertIn("## Fake", chunks[0].text)
+            self.assertIn("# Also Fake", chunks[0].text)
+
+    def test_unclosed_fence_and_heading_only_section_are_retained(self) -> None:
+        doc = Document("code", "Code", "## Standalone\n\n## Code\n```\n# Fake", "code.md")
+        chunks = HeadingAwareChunker().chunk_document(doc)
+        self.assertEqual([chunk.section_title for chunk in chunks], ["Standalone", "Code"])
+        self.assertIn("# Fake", chunks[1].text)
+        title_only = HeadingAwareChunker().chunk_document(Document("title", "Title", "# Title", "title.md"))
+        self.assertEqual(len(title_only), 1)
+        self.assertIn("Title", title_only[0].text)
+
+    def test_invalid_configuration_is_rejected(self) -> None:
+        for config in ({"overlap_chars": 1}, {"overlap_chars": -1}, {"min_chunk_chars": -1}, {"max_chunk_chars": 50}):
+            with self.assertRaises(ValueError):
+                HeadingAwareChunker(**config)
 
     def test_load_corpus_directory(self) -> None:
         corpus_dir = RAG_DIR / "corpus"

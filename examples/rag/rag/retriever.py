@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, List, Mapping, Optional
+from typing import Any
 
 from contracts.models import EmbeddingRequest
 from contracts.ports import EmbeddingPort
@@ -43,7 +44,7 @@ class Retriever:
         vector_index: VectorIndexPort,
         embedding_model: str = "nomic-embed-text",
         default_top_k: int = 3,
-        min_relevance_score: Optional[float] = None,
+        min_relevance_score: float | None = None,
     ) -> None:
         self.embedding_port = embedding_port
         self.vector_index = vector_index
@@ -54,11 +55,11 @@ class Retriever:
     async def retrieve(
         self,
         query: str,
-        top_k: Optional[int] = None,
-        filters: Optional[Mapping[str, Any]] = None,
-        min_score: Optional[float] = None,
-        context: Optional[AiOperationContext] = None,
-    ) -> List[RetrievalResult]:
+        top_k: int | None = None,
+        filters: Mapping[str, Any] | None = None,
+        min_score: float | None = None,
+        context: AiOperationContext | None = None,
+    ) -> list[RetrievalResult]:
         """Execute semantic retrieval for a user query.
 
         Does NOT invoke any text generation model or LLM.
@@ -83,7 +84,7 @@ class Retriever:
         )
 
         # 3. Format into ranked results (1-indexed)
-        results: List[RetrievalResult] = []
+        results: list[RetrievalResult] = []
         for rank, sc in enumerate(scored_chunks, start=1):
             results.append(
                 RetrievalResult(

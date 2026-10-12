@@ -4,7 +4,7 @@
 > **Application Domain**: Knowledge Intelligence (`knowledge-intelligence`)  
 > **Intelligence Pattern**: Retrieval-Augmented Generation (`retrieval-augmented-generation`)  
 > **Architecture Pattern**: Hexagonal Architecture (`hexagonal`)  
-> **Target Ecosystem**: Python 3.9+  
+> **Target Ecosystem**: Python 3.11+
 > **Status**: Implemented  
 
 ---
@@ -14,7 +14,7 @@
 Enterprise AI applications require reliable access to private domain documents while satisfying four strict architectural requirements:
 1. **Retrieval Independence**: The system must be capable of evaluating retrieval precision and recall independently of language model generation.
 2. **Untrusted Context Boundaries**: Retrieved documents are untrusted data and may contain prompt injections or instruction overrides. The application must enforce explicit context delimiters and anti-injection instructions.
-3. **Application-Controlled Citations**: Citations must be strictly verified against actually retrieved evidence chunks by application logic. Language models must never be allowed to hallucinate or spoof source attribution.
+3. **Application-Controlled Citations**: Citations must be verified against evidence actually supplied in the prompt. This verifies source identity; factual support for individual claims requires separate evaluation.
 4. **Explicit Abstention**: When private knowledge lacks sufficient facts to answer a query, the system must explicitly report insufficient evidence rather than confabulating unsupported answers.
 
 This reference pattern implements a complete, provider-neutral, evaluation-driven RAG architecture adhering to the repository's local-first execution governance.
@@ -29,10 +29,11 @@ This reference pattern implements a complete, provider-neutral, evaluation-drive
 flowchart TD
     A[Markdown Corpus (.md)] --> B[Document Ingestion & Normalizer]
     B --> C[HeadingAwareChunker]
-    C --> D[Chunks with Stable IDs: doc#c0]
-    D --> E[EmbeddingPort: OllamaEmbeddingAdapter / Test Stub]
-    E --> F[Dense Embedding Vectors]
-    F --> G[InMemoryVectorIndex]
+    C --> D[Chunks: positional citation ID + content hash]
+    D --> E[SQLite preparation cache: reuse unchanged embeddings]
+    E --> F[EmbeddingPort: embed missing text only]
+    F --> E
+    E --> G[InMemoryVectorIndex: exact cosine search]
 ```
 
 ### 2.2 Query & Generation Flow
@@ -63,7 +64,7 @@ sequenceDiagram
     Service->>LLM: generate(CompletionRequest(prompt, schema))
     LLM-->>Service: CompletionResponse(raw_json)
 
-    Service->>Validator: validate(cited_ids, retrieved_chunks)
+    Service->>Validator: validate(cited_ids, supplied_chunks)
     Validator-->>Service: CitationValidationResult(verified_citations)
 
     Service-->>User: RAGResponse(answer, verified_citations, telemetry)
@@ -89,7 +90,7 @@ All retrieved chunk texts are wrapped inside strict delimiter boundaries by `Con
 The system prompt explicitly instructs the foundation model to treat evidence text strictly as inert informational data and to never execute instructions or directives embedded within retrieved documents.
 
 ### 3.3 Application-Level Citation Validation
-The model outputs citation identifiers matching source tags provided in the evidence. `CitationValidator` cross-references cited chunk IDs against the set of chunks actually returned during retrieval:
+The model outputs citation identifiers matching source tags provided in the evidence. `CitationValidator` cross-references cited chunk IDs against passages included by `ContextBuilder`, excluding retrieved passages omitted by budgeting:
 * **Verified Citations**: Validated chunk IDs are enriched with source document metadata (title, URI, section).
 * **Spoofed/Hallucinated Citations**: Any chunk ID cited by the model that was not present in the retrieved context is immediately rejected and recorded in telemetry.
 
@@ -98,6 +99,22 @@ When retrieved evidence does not contain facts necessary to answer a user's ques
 
 ---
 
+### 3.5 Chunk, Request and Response Contracts
+
+`HeadingAwareChunker` enforces `max_chunk_chars` including repeated heading prefixes and splits oversized paragraphs. Short introductions and final fragments are retained; `min_chunk_chars` never discards content. Both backtick and tilde fences suppress heading detection. Non-zero `overlap_chars` raises `ValueError`. Oversized heading text is split as content while its complete section title remains metadata.
+
+`ContextBuilder.max_chars` includes all delimiters, source/section headers, separators and truncation markers. If no passage can fit, it supplies no evidence. `RAGService.max_request_chars` (default 8000) bounds the combined system prompt and fully formatted user prompt, reserving instructions and the complete question before evidence is built. Oversized fixed input raises `ValueError` before retrieval; insufficient evidence space short-circuits without generation. `max_output_tokens` (default 512) separately caps output. These are input character and output token limits, not a provider-specific tokenizer estimate or HTTP payload byte limit.
+
+The response schema requires exactly a non-empty string `answer`, a list of non-empty string `citations`, and boolean `insufficient_evidence`; no coercion, duplicate JSON keys or extra fields are accepted. A complete Markdown JSON fence is tolerated. Normal answers require citations, and abstentions require none. Invalid schema or citation membership yields `status="validation_failed"`, `accepted=False`, `validation_error`, an empty `answer` and empty public `citations`. `raw_model_output` remains diagnostic data. Callers should check `accepted`/`status` before presenting an answer. Contract acceptance is not factual verification.
+
+### 3.6 Persistence and Incremental Synchronization
+
+The demo uses `CorpusCache` by default. It stores documents, chunks and embeddings in local SQLite and hydrates the existing exact index on startup. It hashes source bytes each synchronization, reuses unchanged parsed documents/chunks, embeds only missing exact text hashes, updates metadata, removes deleted sources and prunes orphaned embeddings. Section movement can change positional citation IDs (`doc#c0`); SHA-256 content identity enables embedding reuse independently of those positions.
+
+Compatibility checks include corpus root, ingestion/chunker versions and settings, embedding provider/model/revision and optional expected dimensions. Live persistence requires the immutable installed embedding model digest via `--embedding-revision`; update it if weights or provider-side embedding behavior change. Do not use mutable tags such as `latest` as revisions. Fake and live identities cannot share embeddings.
+
+Preparation publishes one atomic transaction after successful embedding/validation. Provider errors preserve the previous snapshot. Competing preparation commits fail with a retry message rather than overwriting a newer generation. Unknown schema versions/unrelated databases are rejected. For a running application, call `CorpusCache.prepare()` after edits and rebuild the retriever and citation catalog together from `PreparedCorpus`; startup synchronization does not automatically refresh an already running service.
+
 ## 4. Module Structure
 
 | Module | Responsibility |
@@ -105,6 +122,7 @@ When retrieved evidence does not contain facts necessary to answer a user's ques
 | `rag/document.py` | `Document` and `Chunk` entities, deterministic ID generation (`{doc_id}#c{idx}`). |
 | `rag/ingestion.py` | Markdown frontmatter extraction, CRLF normalization, whitespace trimming. |
 | `rag/chunker.py` | `HeadingAwareChunker` preserving section headers and document metadata. |
+| `rag/persistence.py`, `rag/cache_schema.sql` | Versioned SQLite preparation cache, atomic updates/deletions, content-addressed embedding reuse and preparation counters/timing. |
 | `rag/vector_index.py` | `InMemoryVectorIndex` with exact cosine similarity, tie-breaking, and metadata filtering. |
 | `rag/retriever.py` | Decoupled retrieval coordinator executing vector search without LLM generation. |
 | `rag/context_builder.py` | Evidence formatting with untrusted delimiters and character budget constraints. |
@@ -130,7 +148,7 @@ The repository includes a domain-neutral, synthetic knowledge corpus located in 
 ## 6. Execution & Verification
 
 ### 6.1 Hermetic Unit Tests (Offline CI)
-Execute the 31 unit tests covering ingestion, chunking, indexing, retrieval, context budgeting, citation verification, and service orchestration:
+Execute hermetic unit and temporary SQLite integration tests covering ingestion, chunking, indexing, restart/update/delete behavior, evidence budgeting, citation verification, and service orchestration:
 
 ```bash
 python3 -m unittest discover -s examples/rag/tests -t examples/rag
@@ -146,9 +164,19 @@ python3 examples/rag/demo.py --mode fake
 # Custom query
 python3 examples/rag/demo.py --mode fake --query "What is the password requirement?"
 
-# Live local mode (requires Ollama with nomic-embed-text and llama3.2)
-python3 examples/rag/demo.py --mode live
+# Live local mode without cache (requires installed Ollama models)
+python3 examples/rag/demo.py --mode live --no-cache
 ```
+
+Run fake mode twice to see warm preparation reuse. The default cache is `examples/rag/data/corpus.sqlite3`, ignored by Git; `--cache` selects another file and `--no-cache` runs the original volatile baseline. For live persistence, append `--embedding-revision` followed by the installed model's immutable digest to the live command. The cache stores source text/vectors in plaintext: use this local example only with data appropriate for your workstation.
+
+Measure deterministic preparation reuse, updates/deletions, exact-search latency and peak traced Python allocations at synthetic volumes:
+
+```bash
+python3 examples/rag/benchmark_preparation.py --documents 100 1000
+```
+
+This benchmark uses model doubles and temporary local SQLite; preparation timings include `tracemalloc` overhead and search timings are measured after tracing stops. It measures software behavior, not real embedding throughput, RSS memory, model quality or representative production capacity. Measure your actual corpus/models before selecting ANN or a persistent vector service.
 
 ### 6.3 Automated Reference AI Evaluation
 Execute the versioned 32-scenario evaluation dataset (`eval_dataset.jsonl`) measuring retrieval and grounded generation metrics. (Note: Per [`QUALITY-GATES.md`](../../QUALITY-GATES.md#gate-d--ai-evaluation), Gate D is mandatory for Tier 1 Reference Applications; this Tier 2 Pattern Example executes evaluation as a voluntary reference quality benchmark):
@@ -190,6 +218,7 @@ To prevent premature complexity and speculative architectural sprawl, the follow
 
 ## 8. Known Limitations
 
-* **Single-Process In-Memory Index**: The default index does not persist embeddings to disk across process restarts; re-indexing is executed during application startup.
+* **Exact In-Memory Search**: Preparation is persisted locally, but vectors are hydrated into memory after restart and every search scans them. This is not an ANN backend or concurrent document-serving system.
 * **Corpus Scope**: Sized as a lean, representative benchmark (7 documents, 18 chunks) optimized for automated test suites and educational inspection rather than enterprise multi-terabyte search.
 * **Dense Embedding Dependence**: Semantic disambiguation depends on dense vector similarity; acronym collisions or specialized domain jargon may require hybrid lexical scoring at scale.
+* **Telemetry**: Recorded timings/counters are metadata, not emitted OpenTelemetry spans. Phase 12 owns the deferred span implementation under [ADR-0012](../../adr/0012-phase-4-telemetry-deferral-and-rag-preparation-cache.md).

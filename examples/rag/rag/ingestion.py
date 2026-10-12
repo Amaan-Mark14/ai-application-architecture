@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from .document import Document
 
@@ -21,7 +20,7 @@ def normalize_text(text: str) -> str:
     return normalized.strip()
 
 
-def parse_frontmatter(raw_text: str) -> Tuple[Dict[str, Any], str]:
+def parse_frontmatter(raw_text: str) -> tuple[dict[str, Any], str]:
     """Extract YAML-like key-value frontmatter from document header."""
     match = FRONTMATTER_PATTERN.match(raw_text)
     if not match:
@@ -29,7 +28,7 @@ def parse_frontmatter(raw_text: str) -> Tuple[Dict[str, Any], str]:
 
     frontmatter_str = match.group(1)
     body = raw_text[match.end() :]
-    metadata: Dict[str, Any] = {}
+    metadata: dict[str, Any] = {}
 
     for line in frontmatter_str.split("\n"):
         line = line.strip()
@@ -67,6 +66,11 @@ def load_markdown_document(file_path: Path) -> Document:
         raise FileNotFoundError(f"Document file not found: {file_path}")
 
     raw_text = file_path.read_text(encoding="utf-8")
+    return load_markdown_text(raw_text, file_path)
+
+
+def load_markdown_text(raw_text: str, file_path: Path) -> Document:
+    """Parse a previously read snapshot so its fingerprint and content agree."""
     metadata, body = parse_frontmatter(raw_text)
     normalized_body = normalize_text(body)
 
@@ -90,12 +94,12 @@ def load_markdown_document(file_path: Path) -> Document:
     )
 
 
-def load_corpus_directory(corpus_dir: Path) -> List[Document]:
+def load_corpus_directory(corpus_dir: Path) -> list[Document]:
     """Load all markdown documents from a corpus directory sorted by filename."""
     if not corpus_dir.is_dir():
         raise NotADirectoryError(f"Corpus directory not found: {corpus_dir}")
 
-    docs: List[Document] = []
+    docs: list[Document] = []
     for file_path in sorted(corpus_dir.glob("*.md")):
         if file_path.name.startswith((".", "_")):
             continue

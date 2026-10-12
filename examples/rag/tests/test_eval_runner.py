@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import sys
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 for p in (REPO_ROOT / "building-blocks" / "python", Path(__file__).resolve().parent.parent):
     if str(p) not in sys.path:
@@ -51,11 +51,11 @@ class TestEvalRunner(unittest.TestCase):
             load_dataset(Path("/nonexistent/path/eval_dataset.jsonl"))
 
     def test_load_dataset_insufficient_scenarios_raises_error(self) -> None:
-        with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as tf:
-            tf.write('{"scenario_id": "rag-01", "scenario_type": "test", "query": "q", "expected_chunk_ids": []}\n')
-            tf.flush()
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = Path(directory) / "small.jsonl"
+            dataset.write_text('{"scenario_id": "rag-01", "scenario_type": "test", "query": "q", "expected_chunk_ids": []}\n', encoding="utf-8")
             with self.assertRaises(ValueError):
-                load_dataset(Path(tf.name))
+                load_dataset(dataset)
 
     def test_evaluate_single_scenario_grounded(self) -> None:
         sc = EvalScenario(
@@ -134,7 +134,7 @@ class TestEvalRunner(unittest.TestCase):
 
     def test_run_evaluation_fake_mode(self) -> None:
         with patch("sys.stdout", new_callable=io.StringIO):
-            summary, results = asyncio.run(
+            summary, _results = asyncio.run(
                 run_evaluation(
                     dataset_path=self.dataset_path,
                     corpus_dir=self.corpus_dir,

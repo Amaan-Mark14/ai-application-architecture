@@ -16,10 +16,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 BUILDING_BLOCKS_PYTHON = REPO_ROOT / "building-blocks" / "python"
@@ -35,13 +33,13 @@ from contracts.models import EmbeddingRequest
 from contracts.ports import EmbeddingPort, TextGenerationPort
 from ollama_adapter.adapter import OllamaAdapter
 from ollama_embedding_adapter.adapter import OllamaEmbeddingAdapter
+from rag.chunker import HeadingAwareChunker
 from rag.citation_validator import CitationValidator
 from rag.context_builder import ContextBuilder
-from rag.document import Chunk, Document
-from rag.chunker import HeadingAwareChunker
 from rag.ingestion import load_corpus_directory
+from rag.persistence import CorpusCache, EmbeddingConfiguration
 from rag.retriever import Retriever
-from rag.service import RAGResponse, RAGService
+from rag.service import RAGService
 from rag.test_doubles import DeterministicEmbeddingStub, DeterministicRAGGenerationStub
 from rag.vector_index import InMemoryVectorIndex
 
@@ -60,6 +58,8 @@ async def build_rag_system(
     embed_model: str,
     gen_model: str,
     top_k: int = 2,
+    cache_path: Path | None = RAG_DIR / "data" / "corpus.sqlite3",
+    embedding_revision: str | None = None,
 ) -> RAGService:
     """Bootstrap RAG service dependencies under fake or live mode."""
     if mode == "live":
@@ -109,18 +109,33 @@ async def build_rag_system(
         llm_port = DeterministicRAGGenerationStub(canned_answers=canned)
 
 
-    # Ingest and index corpus
-    docs = load_corpus_directory(corpus_dir)
     chunker = HeadingAwareChunker(max_chunk_chars=1000)
-    all_chunks = []
-    for d in docs:
-        all_chunks.extend(chunker.chunk_document(d))
-
-    req = EmbeddingRequest(inputs=[c.text for c in all_chunks], model=embed_model)
-    emb_resp = await embedding_port.embed(req)
-
-    index = InMemoryVectorIndex(dimensions=emb_resp.dimensions)
-    index.add_batch(all_chunks, emb_resp.embeddings)
+    if cache_path is not None:
+        if mode == "live" and not embedding_revision:
+            raise ValueError("Persistent live preparation requires an immutable embedding_revision")
+        prepared = await CorpusCache(cache_path).prepare(
+            corpus_dir, embedding_port,
+            EmbeddingConfiguration(
+                provider=f"ollama:{endpoint.rstrip('/')}" if mode == "live" else "deterministic-stub",
+                model=embed_model,
+                revision=embedding_revision or "term-hashing-v1",
+                dimensions=None if mode == "live" else 512,
+            ),
+            chunker=chunker,
+        )
+        docs, index = prepared.documents, prepared.index
+        stats = prepared.stats
+        print(f"Preparation: {stats.loaded_documents} documents parsed, {stats.reused_documents} reused, "
+              f"{stats.deleted_documents} deleted; {stats.embedded_texts} texts embedded, "
+              f"{stats.reused_chunks} chunk embeddings reused ({stats.elapsed_ms:.1f}ms)")
+    else:
+        docs = load_corpus_directory(corpus_dir)
+        all_chunks = [chunk for doc in docs for chunk in chunker.chunk_document(doc)]
+        index = InMemoryVectorIndex()
+        if all_chunks:
+            req = EmbeddingRequest(inputs=[c.text for c in all_chunks], model=embed_model)
+            emb_resp = await embedding_port.embed(req)
+            index.add_batch(all_chunks, emb_resp.embeddings)
 
     retriever = Retriever(embedding_port=embedding_port, vector_index=index, embedding_model=embed_model, default_top_k=top_k)
     validator = CitationValidator(document_catalog={d.document_id: d for d in docs})
@@ -157,8 +172,8 @@ async def execute_query_demo(service: RAGService, query: str, top_k: int = 2) ->
     print(f"  Context Characters: {response.context_build.total_chars}")
     print(f"  Truncated: {response.context_build.truncated}")
 
-    print("\n[GROUNDED GENERATION ANSWER]")
-    print(f"  {response.answer}")
+    print(f"\n[RESPONSE STATUS: {response.status.upper()}]")
+    print(f"  {response.validation_error if not response.accepted else response.answer}")
 
     print("\n[VERIFIED CITATIONS]")
     if response.citations:
@@ -186,6 +201,8 @@ async def main_async(args: argparse.Namespace) -> int:
         embed_model=args.embed_model,
         gen_model=args.gen_model,
         top_k=args.top_k,
+        cache_path=None if args.no_cache else Path(args.cache),
+        embedding_revision=args.embedding_revision,
     )
 
     if args.query:
@@ -207,7 +224,12 @@ def main() -> int:
     parser.add_argument("--embed-model", default="nomic-embed-text", help="Embedding model name")
     parser.add_argument("--gen-model", default="llama3.2", help="Generation model name")
     parser.add_argument("--top-k", type=int, default=2, help="Retrieval depth (default: 2)")
+    parser.add_argument("--cache", default=str(RAG_DIR / "data" / "corpus.sqlite3"), help="Local SQLite preparation cache")
+    parser.add_argument("--no-cache", action="store_true", help="Rebuild the in-memory baseline without persistence")
+    parser.add_argument("--embedding-revision", help="Immutable model revision/digest; required for live persistence")
     args = parser.parse_args()
+    if args.mode == "live" and not args.no_cache and not args.embedding_revision:
+        parser.error("Live persistence requires --embedding-revision with the installed model digest, or --no-cache")
 
     return asyncio.run(main_async(args))
 

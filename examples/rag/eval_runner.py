@@ -18,13 +18,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 BUILDING_BLOCKS_DIR = REPO_ROOT / "building-blocks" / "python"
@@ -40,8 +39,8 @@ from contracts.models import EmbeddingRequest
 from contracts.ports import EmbeddingPort, TextGenerationPort
 from ollama_adapter.adapter import OllamaAdapter
 from ollama_embedding_adapter.adapter import OllamaEmbeddingAdapter
-from rag.citation_validator import CitationValidator
 from rag.chunker import HeadingAwareChunker
+from rag.citation_validator import CitationValidator
 from rag.document import Chunk, Document
 from rag.ingestion import load_corpus_directory
 from rag.retriever import Retriever
@@ -61,11 +60,11 @@ class EvalScenario:
     scenario_id: str
     scenario_type: str
     query: str
-    expected_chunk_ids: List[str]
-    expected_document_ids: List[str]
-    expected_facts: List[str]
+    expected_chunk_ids: list[str]
+    expected_document_ids: list[str]
+    expected_facts: list[str]
     expected_abstention: bool
-    metadata_filter: Optional[Dict[str, Any]]
+    metadata_filter: dict[str, Any] | None
     description: str
 
 
@@ -74,7 +73,7 @@ class ScenarioEvalResult:
     scenario_id: str
     scenario_type: str
     query: str
-    retrieved_chunk_ids: List[str]
+    retrieved_chunk_ids: list[str]
     recall_at_k: float
     hit: bool
     reciprocal_rank: float
@@ -85,7 +84,7 @@ class ScenarioEvalResult:
     abstention_accurate: bool
     latency_ms: float
     answer: str
-    error: Optional[str] = None
+    error: str | None = None
 
 
 @dataclass
@@ -107,19 +106,19 @@ class RAGEvalSummary:
     # Evaluation Harness & Governance Assessment
     harness_passed: bool
     reference_thresholds_met: bool
-    reference_threshold_details: Dict[str, Any]
+    reference_threshold_details: dict[str, Any]
     real_ai_quality_verified: bool
     gate_d_applicable: bool = False
     gate_d_status: str = "NOT_APPLICABLE"
-    type_breakdown: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    type_breakdown: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
-def load_dataset(dataset_path: Path) -> List[EvalScenario]:
+def load_dataset(dataset_path: Path) -> list[EvalScenario]:
     """Load and validate the versioned eval_dataset.jsonl file."""
     if not dataset_path.is_file():
         raise FileNotFoundError(f"Evaluation dataset not found at: {dataset_path}")
 
-    scenarios: List[EvalScenario] = []
+    scenarios: list[EvalScenario] = []
     with open(dataset_path, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, start=1):
             line = line.strip()
@@ -151,12 +150,12 @@ async def setup_knowledge_index(
     corpus_dir: Path,
     embedding_port: EmbeddingPort,
     embedding_model: str,
-) -> Tuple[InMemoryVectorIndex, List[Document], List[Chunk]]:
+) -> tuple[InMemoryVectorIndex, list[Document], list[Chunk]]:
     """Ingest, chunk, embed, and index the reference corpus."""
     docs = load_corpus_directory(corpus_dir)
     chunker = HeadingAwareChunker(max_chunk_chars=1000)
 
-    all_chunks: List[Chunk] = []
+    all_chunks: list[Chunk] = []
 
     for doc in docs:
         chunks = chunker.chunk_document(doc)
@@ -185,7 +184,7 @@ def evaluate_single_scenario(
     if scenario.expected_abstention or not expected_cids:
         # For unanswerable queries, retrieval metrics don't penalize if no chunks were relevant
         recall = 1.0 if not expected_cids else 0.0
-        hit = True if response.insufficient_evidence else False
+        hit = response.insufficient_evidence
         rr = 1.0 if response.insufficient_evidence else 0.0
         context_relevance = 1.0 if response.insufficient_evidence else 0.5
     else:
@@ -217,9 +216,9 @@ def evaluate_single_scenario(
 
     # Abstention accuracy
     if scenario.expected_abstention:
-        abstention_accurate = response.insufficient_evidence
+        abstention_accurate = response.accepted and response.insufficient_evidence
     else:
-        abstention_accurate = not response.insufficient_evidence
+        abstention_accurate = response.accepted and not response.insufficient_evidence
 
     # Groundedness: check if expected facts are contained in answer, and citations are verified
     if scenario.expected_abstention:
@@ -229,11 +228,11 @@ def evaluate_single_scenario(
         has_verified_citations = len(response.citations) > 0
         # Check expected facts presence in answer
         facts_present = all(fact.lower() in response.answer.lower() for fact in scenario.expected_facts)
-        grounded = has_verified_citations and facts_present and not response.insufficient_evidence
+        grounded = response.accepted and has_verified_citations and facts_present and not response.insufficient_evidence
 
     # Citation accuracy: verified citations / total citations produced
     if scenario.expected_abstention:
-        citation_acc = 1.0 if len(response.citations) == 0 else 0.0
+        citation_acc = 1.0 if response.accepted and len(response.citations) == 0 else 0.0
     else:
         total_cited = len(response.citation_validation.verified_citations) + len(response.citation_validation.rejected_citation_ids)
         if total_cited == 0:
@@ -256,6 +255,7 @@ def evaluate_single_scenario(
         abstention_accurate=abstention_accurate,
         latency_ms=response.latency_ms,
         answer=response.answer,
+        error=response.validation_error,
     )
 
 
@@ -268,7 +268,7 @@ async def run_evaluation(
     endpoint: str = "http://localhost:11434",
     top_k: int = 2,
     allow_unverified: bool = False,
-) -> Tuple[Optional[RAGEvalSummary], List[ScenarioEvalResult]]:
+) -> tuple[RAGEvalSummary | None, list[ScenarioEvalResult]]:
     """Run full evaluation suite over dataset scenarios."""
     scenarios = load_dataset(dataset_path)
 
@@ -279,7 +279,7 @@ async def run_evaluation(
 
         is_healthy = await embed_adapter.check_health()
         if not is_healthy:
-            print(f"\n[LIVE EVALUATION STATUS: NOT VERIFIED]")
+            print("\n[LIVE EVALUATION STATUS: NOT VERIFIED]")
             print(f"Reason: Ollama daemon is unreachable at '{endpoint}'.")
             if allow_unverified:
                 return None, []
@@ -291,7 +291,7 @@ async def run_evaluation(
         has_gen_model = any(generation_model.split(":")[0] in m for m in installed)
 
         if not has_embed_model or not has_gen_model:
-            print(f"\n[LIVE EVALUATION STATUS: NOT VERIFIED]")
+            print("\n[LIVE EVALUATION STATUS: NOT VERIFIED]")
             print(f"Installed models: {installed}")
             if not has_embed_model:
                 print(f"Missing required embedding model: '{embedding_model}'. Run `ollama pull {embedding_model}`.")
@@ -306,7 +306,7 @@ async def run_evaluation(
     else:
         embedding_port = DeterministicEmbeddingStub(dimensions=512)
         # Create deterministic canned responses for the scenarios
-        canned: Dict[str, Dict[str, Any]] = {}
+        canned: dict[str, dict[str, Any]] = {}
         for sc in scenarios:
             if sc.expected_abstention:
                 canned[sc.query] = {
@@ -333,7 +333,7 @@ async def run_evaluation(
     service = RAGService(retriever=retriever, llm_client=llm_port, citation_validator=validator, model=generation_model)
 
     print(f"\nExecuting evaluation across {len(scenarios)} scenarios (mode={mode}, top_k={top_k})...")
-    results: List[ScenarioEvalResult] = []
+    results: list[ScenarioEvalResult] = []
 
     for i, sc in enumerate(scenarios, start=1):
         res = await service.answer(
@@ -361,7 +361,7 @@ async def run_evaluation(
     avg_latency = sum(r.latency_ms for r in results) / total
 
     # Reference threshold assessment against Tier 1 quantitative benchmarks
-    reference_threshold_details = {
+    reference_threshold_details: dict[str, dict[str, Any]] = {
         "scenario_count": {"measured": total, "required": GATE_D_MIN_SCENARIOS, "passed": total >= GATE_D_MIN_SCENARIOS},
         "groundedness": {"measured": round(groundedness, 4), "required": GATE_D_GROUNDEDNESS_THRESHOLD, "passed": groundedness >= GATE_D_GROUNDEDNESS_THRESHOLD},
         "context_relevance": {"measured": round(mean_context_rel, 4), "required": GATE_D_CONTEXT_RELEVANCE_THRESHOLD, "passed": mean_context_rel >= GATE_D_CONTEXT_RELEVANCE_THRESHOLD},
@@ -375,8 +375,8 @@ async def run_evaluation(
     gate_d_status = "NOT_APPLICABLE"
 
     # Type breakdown
-    types = sorted(list(set(sc.scenario_type for sc in scenarios)))
-    type_breakdown: Dict[str, Dict[str, float]] = {}
+    types = sorted({sc.scenario_type for sc in scenarios})
+    type_breakdown: dict[str, dict[str, float]] = {}
     for st in types:
         st_res = [r for r in results if r.scenario_type == st]
         type_breakdown[st] = {
@@ -388,7 +388,7 @@ async def run_evaluation(
     summary = RAGEvalSummary(
         total_scenarios=total,
         mode=mode,
-        timestamp=datetime.utcnow().isoformat() + "Z",
+        timestamp=datetime.now(UTC).isoformat(),
         hit_rate=round(hit_rate, 4),
         mean_recall_at_k=round(mean_recall, 4),
         mrr=round(mrr, 4),
@@ -459,7 +459,7 @@ def print_report(summary: RAGEvalSummary) -> None:
     print("=" * 70)
 
 
-def save_report(summary: RAGEvalSummary, results: List[ScenarioEvalResult], output_dir: Path) -> Path:
+def save_report(summary: RAGEvalSummary, results: list[ScenarioEvalResult], output_dir: Path) -> Path:
     """Save structured evaluation report JSON file."""
     output_dir.mkdir(parents=True, exist_ok=True)
     report_file = output_dir / f"eval_report_{int(time.time())}.json"

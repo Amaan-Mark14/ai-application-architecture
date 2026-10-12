@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -20,7 +22,7 @@ class Document:
         if not self.document_id or not self.document_id.strip():
             raise ValueError("Document document_id must be a non-empty string")
         if not isinstance(self.content, str):
-            raise ValueError("Document content must be a string")
+            raise TypeError("Document content must be a string")
 
 
 
@@ -35,8 +37,13 @@ class Chunk:
     document_id: str
     chunk_index: int
     text: str
-    section_title: Optional[str] = None
+    section_title: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def content_hash(self) -> str:
+        """Identity of exact embedding input, independent of positional citation IDs."""
+        return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
 
     def __post_init__(self) -> None:
         if not self.chunk_id or not self.chunk_id.strip():

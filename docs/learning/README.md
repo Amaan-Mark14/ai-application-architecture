@@ -58,11 +58,11 @@ Phase 3: Tiered Reference Implementation Templates
 
 AI ENGINEERING & CAPABILITIES (PHASES 4–14)
 ──────────────────────────────────────────────────────────────────────────
-Phase 4: AI Foundations [FROZEN & VERIFIED]
+Phase 4: AI Foundations [IMPLEMENTED; SPANS DEFERRED TO PHASE 12, GATE F UNMET]
   "How does an application safely communicate with an LLM?"
   → [Phase 04 Learning Guide](phase-04-ai-foundations.md)
         ↓
-Phase 5: Knowledge Intelligence & RAG [ACCEPTED & FREEZE-READY]
+Phase 5: Knowledge Intelligence & RAG [IMPLEMENTED; CORRECTIONS PENDING INDEPENDENT REVIEW]
   "How will the LLM securely ground reasoning in private enterprise knowledge?"
   → [Phase 05 Learning Guide](phase-05-knowledge-intelligence-rag.md)
         ↓

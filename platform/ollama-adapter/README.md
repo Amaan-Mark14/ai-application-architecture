@@ -100,7 +100,8 @@ All exceptions are mapped into the domain `AiError` taxonomy (`building-blocks/p
 ## 5. Security & Observability Considerations
 
 * **Security Boundaries**: Zero external credentials required for local Mode A execution. All inputs sent to Ollama are serialized as JSON; no shell or process execution is performed. Model responses are returned as untrusted text to be parsed by consuming use cases.
-* **Observability**: Translates Ollama nanosecond timing (`total_duration`) to millisecond latencies (`latency_ms`), captures prompt and completion tokens in `UsageMetrics`, and correlates `AiOperationContext` attributes.
+* **Recorded Telemetry Metadata**: Translates Ollama nanosecond timing (`total_duration`) to millisecond latencies (`latency_ms`), captures model name and prompt/completion tokens in `UsageMetrics`, and copies `AiOperationContext` correlation attributes. These response fields do not create, emit or export OpenTelemetry spans.
+* **Span Deferral**: [ADR-0012](../../adr/0012-phase-4-telemetry-deferral-and-rag-preparation-cache.md) assigns span implementation and local exporter verification to Phase 12. Phase 4's reconciled delivery criteria cover metadata only; Gate F remains unmet.
 * **Sensitive Data Redaction**: Adapter does not log prompt or output text to stdout in production execution paths.
 
 ---
@@ -130,5 +131,5 @@ Per authoritative [QUALITY-GATES.md](../../QUALITY-GATES.md), Tier 3 platform co
 - [x] **Gate A — Architecture & Structural Boundaries**: Inward dependency direction maintained; zero reverse dependencies on applications; ports decouple core contracts from infrastructure.
 - [ ] **Gate B — Code Quality & Type Safety**: Strictly typed with standard Python type annotations; formal external linters (`mypy`, `ruff`) not installed/run in CI (*Partially Verified*).
 - [ ] **Gate C — Software Testing**: 15 hermetic unit tests verifying request/response mapping, error translation, timeout classification, and retries; statement coverage measurement: *Not Verified* (coverage tooling not installed).
-- [ ] **Gate F — Observability & Telemetry**: Minimal metadata extraction implemented (`latency_ms`, token `UsageMetrics`, model name); distributed OpenTelemetry trace exporter and span emission: *Deferred*.
+- [ ] **Gate F — Observability & Telemetry**: Metadata extraction implemented (`latency_ms`, token `UsageMetrics`, model name, correlation attributes). OpenTelemetry spans and export are absent; **Gate F unmet, deferred to Phase 12** under [ADR-0012](../../adr/0012-phase-4-telemetry-deferral-and-rag-preparation-cache.md).
 - [x] **Gate H — Documentation & Architectural Integrity**: Stable, documented public contracts, architecture specifications, and zero broken links.

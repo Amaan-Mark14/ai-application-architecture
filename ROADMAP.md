@@ -102,11 +102,12 @@ Workflows   Intel       Intel       Real-Time   Synthesis   Intel & Plat Audit  
 * **Scope**:
   * Concrete local runtime adapter for **Ollama**.
   * Structured output generation with schema validation (Pydantic / Zod).
-  * Minimal OpenTelemetry tracing emitting model name, latency, and token metrics.
+  * Model name, latency, token usage and correlation attributes recorded as response metadata. This is metadata collection, not OpenTelemetry span emission or export.
   * Minimal evaluation harness executing benchmark scoring against local models.
   * Minimal input validation guardrail.
 * **Dependencies**: Phase 3.
-* **Exit Criteria**: Working local Ollama integration executing structured generation with automated test coverage and telemetry spans.
+* **Exit Criteria**: Working local Ollama integration executing structured generation with automated test coverage and recorded telemetry metadata.
+* **Explicit Telemetry Deferral**: Per [ADR-0012](adr/0012-phase-4-telemetry-deferral-and-rag-preparation-cache.md), OpenTelemetry span implementation and local export verification belong to Phase 12. Phase 4 delivery does not satisfy Gate F for the Tier 3 adapter; that gate remains unmet until spans are implemented and tested. This phase-scope deferral does not weaken [QUALITY-GATES.md](QUALITY-GATES.md).
 
 ---
 
@@ -117,6 +118,7 @@ Workflows   Intel       Intel       Real-Time   Synthesis   Intel & Plat Audit  
     * Provider-neutral embedding boundary (`EmbeddingPort`) and local Ollama embedding adapter (`platform/ollama-embedding-adapter`).
     * Markdown document ingestion, frontmatter parsing, and heading-aware structural chunking with deterministic identifiers.
     * In-memory cosine vector index with metadata filtering and deterministic tie-breaking.
+    * Local SQLite preparation cache with document fingerprints, content-addressed embedding reuse, configuration compatibility checks and atomic incremental updates/deletions, per [ADR-0012](adr/0012-phase-4-telemetry-deferral-and-rag-preparation-cache.md). Exact search still runs in memory.
     * Decoupled semantic retriever with two-tier evidence-sufficiency threshold policy.
     * Defensive context construction with character budgeting and untrusted delimiter framing.
     * Grounded generation consuming frozen Phase 4 `TextGenerationPort`.
@@ -214,8 +216,9 @@ Workflows   Intel       Intel       Real-Time   Synthesis   Intel & Plat Audit  
 * **Scope**:
   * Decision intelligence reference application combining deterministic rules, ML scores, and LLM reasoning.
   * Advanced platform capabilities: consolidated evaluation dashboards, centralized model gateway with dynamic routing, and cloud deployment blueprints.
+  * Implement OpenTelemetry spans at model boundaries deferred from Phase 4, including model, duration, token usage and success/error state; verify local export and redaction without requiring a hosted observability service.
 * **Dependencies**: Phase 11.
-* **Exit Criteria**: Auditable decision traces generated; centralized model gateway demonstrates fallback routing and rate limiting.
+* **Exit Criteria**: Auditable decision traces generated; centralized model gateway demonstrates fallback routing and rate limiting; deferred model spans emitted and verified through a local or in-memory exporter against Gate F.
 
 ---
 

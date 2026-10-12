@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Sequence, Set
 
 from .document import Chunk, Document
 
@@ -24,20 +24,20 @@ class CitationValidationResult:
     """Result of validating model-generated citations against retrieved evidence."""
 
     is_valid: bool
-    verified_citations: List[Citation]
-    rejected_citation_ids: List[str]
+    verified_citations: list[Citation]
+    rejected_citation_ids: list[str]
     has_insufficient_evidence: bool = False
-    errors: List[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
 class CitationValidator:
-    """Validates citations to ensure that claims originate strictly from retrieved evidence.
+    """Validates source identity against supplied evidence, not factual entailment.
 
     Protects against citation spoofing (where an LLM invents or hallucinates source identifiers).
     """
 
-    def __init__(self, document_catalog: Optional[Mapping[str, Document]] = None) -> None:
-        self._catalog: Dict[str, Document] = dict(document_catalog) if document_catalog else {}
+    def __init__(self, document_catalog: Mapping[str, Document] | None = None) -> None:
+        self._catalog: dict[str, Document] = dict(document_catalog) if document_catalog else {}
 
     def register_documents(self, documents: Sequence[Document]) -> None:
         """Register source documents to enable resolving chunk IDs to document metadata."""
@@ -51,18 +51,18 @@ class CitationValidator:
         insufficient_evidence: bool = False,
     ) -> CitationValidationResult:
         """Validate raw citation identifiers produced by a generation model."""
-        retrieved_map: Dict[str, Chunk] = {c.chunk_id: c for c in retrieved_chunks}
-        verified: List[Citation] = []
-        rejected: List[str] = []
-        errors: List[str] = []
-        seen_chunk_ids: Set[str] = set()
+        retrieved_map: dict[str, Chunk] = {c.chunk_id: c for c in retrieved_chunks}
+        verified: list[Citation] = []
+        rejected: list[str] = []
+        errors: list[str] = []
+        seen_chunk_ids: set[str] = set()
 
         if insufficient_evidence:
             # If model reports insufficient evidence, citations should typically be empty
             if cited_ids:
                 errors.append("Citations were provided despite insufficient_evidence being True")
             return CitationValidationResult(
-                is_valid=True,
+                is_valid=not cited_ids,
                 verified_citations=[],
                 rejected_citation_ids=list(cited_ids),
                 has_insufficient_evidence=True,
@@ -75,6 +75,8 @@ class CitationValidator:
             clean_id = clean_id.replace("[", "").replace("]", "").replace("Source ID:", "").strip()
 
             if not clean_id:
+                rejected.append(raw_id)
+                errors.append("Citation identifier is empty")
                 continue
 
             if clean_id in seen_chunk_ids:
@@ -102,7 +104,9 @@ class CitationValidator:
                 errors.append(f"Citation '{clean_id}' was not present in retrieved context")
 
         # Result is valid if all provided citations were successfully verified against retrieved evidence
-        is_valid = len(rejected) == 0
+        if not verified:
+            errors.append("An answer requires at least one supplied evidence citation")
+        is_valid = len(rejected) == 0 and bool(verified)
 
         return CitationValidationResult(
             is_valid=is_valid,
