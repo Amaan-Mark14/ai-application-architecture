@@ -8,11 +8,13 @@ from __future__ import annotations
 import json
 import sys
 import time
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from .protocol import (
     JsonRpcError,
     JsonRpcErrorCode,
+    JsonRpcNotification,
     JsonRpcRequest,
     JsonRpcResponse,
 )
@@ -24,8 +26,10 @@ class McpServer:
     def __init__(self, server_name: str = "reference-mcp-server", version: str = "1.0.0") -> None:
         self.server_name = server_name
         self.version = version
-        self._tools: Dict[str, Dict[str, Any]] = {}
-        self._handlers: Dict[str, Callable[[Mapping[str, Any]], Any]] = {}
+        self._tools: dict[str, dict[str, Any]] = {}
+        self._handlers: dict[str, Callable[[Mapping[str, Any]], Any]] = {}
+        self._initialized = False
+        self._initialize_received = False
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -45,21 +49,11 @@ class McpServer:
             description="Send a latency ping to verify MCP server responsiveness.",
             input_schema={
                 "type": "object",
-                "properties": {
-                    "echo": {"type": "string", "description": "Optional echo message"}
-                },
+                "properties": {"echo": {"type": "string", "description": "Optional echo message"}},
                 "additionalProperties": False,
             },
             handler=self._handle_ping,
         )
-
-    def register_tool(
-        name: str,  # type: ignore[misc]
-        description: str,
-        input_schema: Mapping[str, Any],
-        handler: Callable[[Mapping[str, Any]], Any],
-    ) -> None:
-        ...
 
     def register_tool(
         self,
@@ -101,6 +95,20 @@ class McpServer:
         params = request.params or {}
 
         if method == "initialize":
+            if (
+                not isinstance(params.get("capabilities"), dict)
+                or not isinstance(params.get("protocolVersion"), str)
+                or not isinstance(params.get("clientInfo"), dict)
+            ):
+                return JsonRpcResponse(
+                    id=request.id,
+                    error=JsonRpcError(
+                        JsonRpcErrorCode.INVALID_PARAMS,
+                        "Invalid initialize parameters",
+                    ),
+                )
+            self._initialize_received = True
+            self._initialized = False
             return JsonRpcResponse(
                 id=request.id,
                 result={
@@ -113,6 +121,18 @@ class McpServer:
                         "tools": {"listChanged": False},
                     },
                 },
+            )
+
+        if method == "ping":
+            return JsonRpcResponse(id=request.id, result={})
+
+        if not self._initialized:
+            return JsonRpcResponse(
+                id=request.id,
+                error=JsonRpcError(
+                    JsonRpcErrorCode.INVALID_REQUEST,
+                    "MCP initialization is not complete",
+                ),
             )
 
         if method == "tools/list":
@@ -153,20 +173,22 @@ class McpServer:
                         "content": [
                             {
                                 "type": "text",
-                                "text": json.dumps(result_content) if not isinstance(result_content, str) else result_content,
+                                "text": json.dumps(result_content)
+                                if not isinstance(result_content, str)
+                                else result_content,
                             }
                         ],
                         "isError": False,
                     },
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 -- contain external tool handler failures.
                 return JsonRpcResponse(
                     id=request.id,
                     result={
                         "content": [
                             {
                                 "type": "text",
-                                "text": f"Tool execution failed: {type(exc).__name__}: {str(exc)}",
+                                "text": f"Tool execution failed: {type(exc).__name__}: {exc!s}",
                             }
                         ],
                         "isError": True,
@@ -181,6 +203,11 @@ class McpServer:
             ),
         )
 
+    def handle_notification(self, notification: JsonRpcNotification) -> None:
+        """Notifications have no response, including unknown methods."""
+        if notification.method == "notifications/initialized" and self._initialize_received:
+            self._initialized = True
+
     def process_message(self, line: str) -> str:
         """Process a single JSON-RPC line and return the response line."""
         clean = line.strip()
@@ -189,15 +216,20 @@ class McpServer:
 
         try:
             data = json.loads(clean)
+            if not isinstance(data, dict):
+                raise ValueError("JSON-RPC message must be an object")  # noqa: TRY004 -- malformed wire message.
+            if "method" in data and "id" not in data:
+                self.handle_notification(JsonRpcNotification.from_dict(data))
+                return ""
             request = JsonRpcRequest.from_dict(data)
             response = self.handle_request(request)
             return response.to_json()
-        except Exception as exc:
+        except (ValueError, TypeError, KeyError) as exc:
             err_resp = JsonRpcResponse(
                 id=0,
                 error=JsonRpcError(
                     code=JsonRpcErrorCode.PARSE_ERROR,
-                    message=f"Parse error: {type(exc).__name__}: {str(exc)}",
+                    message=f"Parse error: {type(exc).__name__}: {exc!s}",
                 ),
             )
             return err_resp.to_json()

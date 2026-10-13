@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -40,6 +41,23 @@ class TestDecisionParser(unittest.TestCase):
         self.assertEqual(decision.decision_type, AgentDecisionType.ACTION)
         self.assertEqual(decision.action_name, "get_customer")
         self.assertEqual(decision.arguments, {"customer_id": "cust-001"})
+
+    def test_decision_fields_require_declared_types(self) -> None:
+        for decision_type, field in (
+            ("final", "final_answer"),
+            ("clarification", "clarification_question"),
+        ):
+            for value in (42, True, {}, [], None, " "):
+                with self.subTest(decision_type=decision_type, value=value):
+                    decision, error = self.engine._parse_decision(
+                        json.dumps({"type": decision_type, field: value})
+                    )
+                    self.assertIsNone(decision)
+                    self.assertIsNotNone(error)
+        for payload in ({"type": 1}, {"type": "final", "final_answer": "ok", "explanation": 4}):
+            decision, error = self.engine._parse_decision(json.dumps(payload))
+            self.assertIsNone(decision)
+            self.assertIsNotNone(error)
 
     def test_parse_action_with_markdown_fences(self) -> None:
         raw = """Here is the next step:

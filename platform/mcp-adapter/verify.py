@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from pathlib import Path
-from typing import Optional
 
 # Ensure building-blocks and adapter paths are in sys.path
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -18,9 +18,10 @@ if str(BUILDING_BLOCKS_DIR) not in sys.path:
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from mcp_adapter.adapter import McpCapabilityAdapter, create_mcp_capabilities
+from contracts.agent import SideEffectLevel
+from mcp_adapter.adapter import McpCapabilityAdapter
 from mcp_adapter.client import McpClient
-from mcp_adapter.protocol import JsonRpcRequest, JsonRpcResponse
+from mcp_adapter.protocol import JsonRpcRequest
 from mcp_adapter.server import McpServer
 
 
@@ -28,13 +29,15 @@ async def run_verification(subprocess_mode: bool = False, allow_unverified: bool
     print("=" * 60)
     print("ai-application-architecture — MCP Platform Adapter Verification")
     print("=" * 60)
-    print(f"Transport Mode: {'Subprocess Stdio' if subprocess_mode else 'In-Memory Stdio Transport'}")
+    print(
+        f"Transport Mode: {'Subprocess Stdio' if subprocess_mode else 'In-Memory Stdio Transport'}"
+    )
 
     try:
         # 1. Verify JSON-RPC 2.0 wire framing
         req = JsonRpcRequest(method="initialize", id=1)
         serialized = req.to_json()
-        deserialized = JsonRpcRequest.from_dict(req.to_dict())
+        deserialized = JsonRpcRequest.from_dict(json.loads(serialized))
         assert deserialized.method == "initialize"
         print("1. JSON-RPC 2.0 Serialization & Framing: PASS")
 
@@ -49,7 +52,9 @@ async def run_verification(subprocess_mode: bool = False, allow_unverified: bool
         try:
             # 3. Protocol handshake
             init_res = client.initialize()
-            print(f"2. MCP Protocol Handshake: PASS (server: {init_res.get('serverInfo', {}).get('name')})")
+            print(
+                f"2. MCP Protocol Handshake: PASS (server: {init_res.get('serverInfo', {}).get('name')})"
+            )
 
             # 4. Tool discovery
             tools = client.list_tools()
@@ -60,6 +65,7 @@ async def run_verification(subprocess_mode: bool = False, allow_unverified: bool
             adapter = McpCapabilityAdapter(
                 client=client,
                 tool_name="get_system_status",
+                side_effect_level=SideEffectLevel.READ_ONLY,
                 allowlist=["get_system_status"],
             )
             print("4. Capability Allowlisting Guard: PASS (enforces least privilege)")
@@ -78,7 +84,7 @@ async def run_verification(subprocess_mode: bool = False, allow_unverified: bool
         print("=" * 60)
         return 0
 
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- verification reports any failed boundary explicitly.
         print("\nStatus: NOT VERIFIED")
         print(f"Reason: MCP verification encountered failure: {exc}")
         print("=" * 60)
@@ -98,7 +104,9 @@ def main() -> int:
         help="Exit with code 0 even if verification fails (for environment-restricted CI)",
     )
     args = parser.parse_args()
-    return asyncio.run(run_verification(subprocess_mode=args.subprocess, allow_unverified=args.allow_unverified))
+    return asyncio.run(
+        run_verification(subprocess_mode=args.subprocess, allow_unverified=args.allow_unverified)
+    )
 
 
 if __name__ == "__main__":

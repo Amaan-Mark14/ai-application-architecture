@@ -170,6 +170,29 @@ examples/agent-execution/
 | `update_customer_note` | `STATE_MUTATING`| **Yes (Mandatory)** | Appends an administrative note to customer account history. Idempotent by `action_id`. |
 | `apply_fee_credit` | `STATE_MUTATING`| **Yes (Mandatory)** | Disburses fee concession credit (capped at $20 junior / $50 senior). Idempotent by `action_id`. |
 
+### Argument validation and replay contracts
+
+The registry validates schema declarations at registration and keeps a separate schema snapshot. Its enforced subset supports one `type` (`object`, `array`, `string`, `integer`, `number`, `boolean`, `null`), recursive `properties`/`required`, boolean `additionalProperties`, array `items`, scalar `enum`, numeric `minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum`, string `minLength`/`maxLength`, and array `minItems`/`maxItems`. `title`, `description`, `default` and `examples` are annotations; defaults are not applied. Empty/annotation-only schemas allow arbitrary finite JSON values, with an object root for arguments. Integer values must be actual Python integers; booleans and integral floats do not qualify. Nesting is bounded to 64 levels. Unsupported keywords, malformed declarations and misplaced rules fail registration; this is not a full JSON Schema implementation.
+
+Values are checked recursively without coercion before authorization or approval. Mutations require a non-blank string `action_id`. Decision `type`, final answers, clarification questions and supplied explanations must have their declared types.
+
+The executor retains an in-memory request/result snapshot for each mutation ID, bound to the capability instance, canonical JSON arguments and trusted execution scope. The engine supplies actor identity/role/permissions and the correlation trace ID (or its generated run ID) as scope. Callers using the executor directly must supply an appropriate `execution_scope` when sharing it across actors or sessions. Identical retries return a JSON-compatible payload with `idempotent_replay=true`, `executed=false`, the original receipt as a dictionary and a separate cached-result copy. Conflicting reuse is rejected before dispatch. Mutations are serialized to prevent simultaneous retries from duplicating effects.
+
+Failed, timed-out and cancelled mutations remain cached because failure does not establish that no side effect occurred. Cache lifetime is the executor lifetime; this provides neither durable crash recovery nor safe automatic re-execution of an uncertain outcome.
+
+
+### Observation limits, failure traces and execution evidence
+
+The engine defaults to `max_observation_chars=8000`, `max_request_chars=32000` (combined system/user text), `max_decision_chars=16000`, and `max_output_tokens=1024`. Limits include framing and explicit truncation markers. Recent history is retained within the request budget; omitted older history is marked. Fixed instructions, tools and the goal are never silently truncated: insufficient space fails before inference. These are character bounds, not tokenizer-context or total-process-memory guarantees.
+
+`ToolExecutor(max_result_chars=16000)` renders oversized JSON results as explicit bounded previews before snapshotting/caching, avoiding complete serialization copies. Observations preserve their untrusted-data delimiters. Truncated previews are incomplete JSON and must not be consumed as complete business results. Allocations made inside a tool before it returns remain outside this boundary.
+
+A step is recorded before entering each boundary. Ordinary context/model/policy/approval/executor/rendering exceptions return a finalized `FAILED` result with a structured failure stage/type and any receipts already produced. Result serialization failures retain a failed receipt for the actual dispatch. Expected business-error observations can still be explained by a subsequent model decision. Cancellation propagates as `AgentRunCancelled` (an `asyncio.CancelledError` subclass), with the finalized result available as `.result`; tool cancellation retains its receipt and uncertain mutation outcome in the cache.
+
+`execute_action()` returns a host-owned `ToolExecutionOutcome` with `kind=executed/replayed/rejected`; `execute_tool()` preserves the receipt/result-pair API. Each trace step binds its exact decision and receipt before rendering. `AgentExecutionResult.execution_receipts` lists physical dispatches only; replays/rejections remain visible in trace steps. Tool-returned replay flags cannot change this classification. Safety metrics inspect ordered, exactly bound steps, so earlier approvals cannot authorize later calls and earlier executions do not become post-rejection violations. Duplicate effects count repeated physical mutation IDs, not cached replays. Missing/inconsistent bindings increment `execution_evidence_errors` and fail the safety verdict rather than guessing execution order or approval.
+
+Implementation inspiration: DeepSeek Harness separates [supported-schema validation](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/core/tools/src/json-schema.ts), immutable tool-call identity and normalized JSON results. These patterns were reviewed; no DeepSeek runtime dependency or copied implementation was introduced.
+
 ---
 
 ## 6. Safety Invariants & Evaluation Metrics
@@ -184,6 +207,7 @@ SAFETY INVARIANTS (ZERO TOLERANCE — DERIVED FROM EXECUTION EVIDENCE):
   Executions After Rejection:            0 [PASS]
   Executions After Max-Step Termination: 0 [PASS]
   Duplicate Mutation Incidents:          0 [PASS]
+  Execution Evidence Errors:            0 [PASS]
   Safety Invariants Status:              PASS
 ```
 
@@ -206,7 +230,7 @@ SAFETY INVARIANTS (ZERO TOLERANCE — DERIVED FROM EXECUTION EVIDENCE):
 python3 examples/agent-execution/verify.py
 ```
 
-### Run Hermetic Unit Tests (58 Tests)
+### Run Hermetic Unit Tests
 ```bash
 python3 -m unittest discover -s examples/agent-execution/tests
 ```

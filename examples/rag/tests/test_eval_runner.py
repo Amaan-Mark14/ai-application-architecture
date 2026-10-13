@@ -8,6 +8,7 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,11 +20,13 @@ for p in (REPO_ROOT / "building-blocks" / "python", Path(__file__).resolve().par
 from eval_runner import (
     EvalScenario,
     RAGEvalSummary,
+    ScenarioEvalResult,
     evaluate_single_scenario,
     load_dataset,
     print_report,
     run_evaluation,
     save_report,
+    summarize_results,
 )
 from rag.citation_validator import Citation, CitationValidationResult
 from rag.context_builder import ContextBuildResult
@@ -53,7 +56,10 @@ class TestEvalRunner(unittest.TestCase):
     def test_load_dataset_insufficient_scenarios_raises_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             dataset = Path(directory) / "small.jsonl"
-            dataset.write_text('{"scenario_id": "rag-01", "scenario_type": "test", "query": "q", "expected_chunk_ids": []}\n', encoding="utf-8")
+            dataset.write_text(
+                '{"scenario_id": "rag-01", "scenario_type": "test", "query": "q", "expected_chunk_ids": []}\n',
+                encoding="utf-8",
+            )
             with self.assertRaises(ValueError):
                 load_dataset(dataset)
 
@@ -69,7 +75,9 @@ class TestEvalRunner(unittest.TestCase):
             metadata_filter=None,
             description="test",
         )
-        chunk = Chunk(chunk_id="sec-01#c1", document_id="sec-01", chunk_index=1, text="Retention is 7 years.")
+        chunk = Chunk(
+            chunk_id="sec-01#c1", document_id="sec-01", chunk_index=1, text="Retention is 7 years."
+        )
         ret_res = RetrievalResult(chunk=chunk, score=0.95, rank=1)
         cit = Citation(
             chunk_id="sec-01#c1",
@@ -78,7 +86,9 @@ class TestEvalRunner(unittest.TestCase):
             source_title="Policy",
             source_uri="sec-01.md",
         )
-        val_res = CitationValidationResult(is_valid=True, verified_citations=[cit], rejected_citation_ids=[])
+        val_res = CitationValidationResult(
+            is_valid=True, verified_citations=[cit], rejected_citation_ids=[]
+        )
 
         resp = RAGResponse(
             query="Audit retention?",
@@ -97,7 +107,7 @@ class TestEvalRunner(unittest.TestCase):
         self.assertEqual(res.recall_at_k, 1.0)
         self.assertEqual(res.reciprocal_rank, 1.0)
         self.assertEqual(res.context_relevance, 1.0)
-        self.assertTrue(res.grounded)
+        self.assertTrue(res.expected_outcome_passed)
         self.assertTrue(res.schema_valid)
         self.assertTrue(res.abstention_accurate)
 
@@ -113,7 +123,12 @@ class TestEvalRunner(unittest.TestCase):
             metadata_filter=None,
             description="test",
         )
-        val_res = CitationValidationResult(is_valid=True, verified_citations=[], rejected_citation_ids=[], has_insufficient_evidence=True)
+        val_res = CitationValidationResult(
+            is_valid=True,
+            verified_citations=[],
+            rejected_citation_ids=[],
+            has_insufficient_evidence=True,
+        )
         resp = RAGResponse(
             query="Quantum flight upgrades?",
             answer="I do not have sufficient evidence.",
@@ -128,7 +143,7 @@ class TestEvalRunner(unittest.TestCase):
 
         res = evaluate_single_scenario(sc, resp)
         self.assertTrue(res.hit)
-        self.assertTrue(res.grounded)
+        self.assertTrue(res.expected_outcome_passed)
         self.assertTrue(res.abstention_accurate)
         self.assertEqual(res.citation_accuracy, 1.0)
 
@@ -144,11 +159,13 @@ class TestEvalRunner(unittest.TestCase):
             )
         self.assertIsNotNone(summary)
         self.assertGreaterEqual(summary.total_scenarios, 30)
-        self.assertGreaterEqual(summary.groundedness_rate, 0.85)
+        self.assertGreaterEqual(summary.expected_outcome_rate, 0.85)
         self.assertGreaterEqual(summary.mean_context_relevance, 0.80)
         self.assertGreaterEqual(summary.schema_adherence_rate, 0.98)
         self.assertTrue(summary.harness_passed)
-        self.assertTrue(summary.reference_thresholds_met)
+        self.assertFalse(summary.reference_thresholds_met)
+        self.assertTrue(summary.software_checks_passed)
+        self.assertIsNone(summary.reference_threshold_details["faithfulness"]["measured"])
         self.assertFalse(summary.real_ai_quality_verified)
         self.assertFalse(summary.gate_d_applicable)
         self.assertEqual(summary.gate_d_status, "NOT_APPLICABLE")
@@ -173,7 +190,8 @@ class TestEvalRunner(unittest.TestCase):
             saved_summary = saved_data["summary"]
             self.assertEqual(saved_summary["mode"], "fake")
             self.assertTrue(saved_summary["harness_passed"])
-            self.assertTrue(saved_summary["reference_thresholds_met"])
+            self.assertFalse(saved_summary["reference_thresholds_met"])
+            self.assertTrue(saved_summary["software_checks_passed"])
             self.assertFalse(saved_summary["real_ai_quality_verified"])
             self.assertFalse(saved_summary["gate_d_applicable"])
             self.assertEqual(saved_summary["gate_d_status"], "NOT_APPLICABLE")
@@ -227,7 +245,9 @@ class TestEvalRunner(unittest.TestCase):
             metadata_filter=None,
             description="test",
         )
-        chunk = Chunk(chunk_id="sec-01#c1", document_id="sec-01", chunk_index=1, text="Retention is 7 years.")
+        chunk = Chunk(
+            chunk_id="sec-01#c1", document_id="sec-01", chunk_index=1, text="Retention is 7 years."
+        )
         ret_res = RetrievalResult(chunk=chunk, score=0.95, rank=1)
         cit = Citation(
             chunk_id="sec-01#c1",
@@ -236,7 +256,9 @@ class TestEvalRunner(unittest.TestCase):
             source_title="Policy",
             source_uri="sec-01.md",
         )
-        val_res = CitationValidationResult(is_valid=True, verified_citations=[cit], rejected_citation_ids=[])
+        val_res = CitationValidationResult(
+            is_valid=True, verified_citations=[cit], rejected_citation_ids=[]
+        )
 
         # RAGResponse with schema_valid=False and schema_error populated
         resp = RAGResponse(
@@ -251,7 +273,10 @@ class TestEvalRunner(unittest.TestCase):
             raw_model_output="Audit logs must be kept for 7 years according to sec-01#c1.",
             schema_valid=False,
             schema_error="JSONDecodeError: Expecting value: line 1 column 1",
-            metadata={"schema_valid": False, "schema_error": "JSONDecodeError: Expecting value: line 1 column 1"},
+            metadata={
+                "schema_valid": False,
+                "schema_error": "JSONDecodeError: Expecting value: line 1 column 1",
+            },
         )
 
         res = evaluate_single_scenario(sc, resp)
@@ -270,14 +295,14 @@ class TestEvalRunner(unittest.TestCase):
             mrr=0.938,
             mean_context_relevance=0.859,
             schema_adherence_rate=1.0,
-            groundedness_rate=1.0,
+            expected_outcome_rate=1.0,
             citation_accuracy_rate=1.0,
             abstention_accuracy_rate=1.0,
             avg_latency_ms=15.0,
             harness_passed=True,
-            reference_thresholds_met=True,
+            reference_thresholds_met=False,
             reference_threshold_details={},
-            real_ai_quality_verified=True,
+            real_ai_quality_verified=False,
             gate_d_applicable=False,
             gate_d_status="NOT_APPLICABLE",
             type_breakdown={},
@@ -285,8 +310,113 @@ class TestEvalRunner(unittest.TestCase):
         with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
             print_report(summary)
             output = mock_stdout.getvalue()
-            self.assertIn("Real AI RAG Quality:          [PASS]", output)
+            self.assertIn("Real AI RAG Quality:          [NOT VERIFIED]", output)
             self.assertIn("Gate D Applicability:         [NOT APPLICABLE TO TIER 2]", output)
+
+    @staticmethod
+    def _observed_result(**changes):
+        result = ScenarioEvalResult(
+            scenario_id="observed",
+            scenario_type="adversarial_injection",
+            query="question",
+            retrieved_chunk_ids=["doc#c0"],
+            recall_at_k=1.0,
+            hit=True,
+            reciprocal_rank=1.0,
+            context_relevance=1.0,
+            schema_valid=True,
+            expected_outcome_passed=True,
+            citation_accuracy=1.0,
+            abstention_accurate=True,
+            latency_ms=1.0,
+            answer="expected fact",
+            adversarial_passed=True,
+        )
+        return replace(result, **changes)
+
+    def test_failing_adversarial_result_cannot_receive_a_pass(self) -> None:
+        results = [self._observed_result(scenario_id=str(index)) for index in range(30)]
+        results[-1] = replace(results[-1], adversarial_passed=False)
+        summary = summarize_results(results, "fake")
+        detail = summary.reference_threshold_details["adversarial_handling"]
+        self.assertFalse(detail["passed"])
+        self.assertEqual(detail["scenario_count"], 30)
+        self.assertAlmostEqual(detail["measured"], 29 / 30)
+        self.assertFalse(summary.software_checks_passed)
+        self.assertFalse(summary.reference_thresholds_met)
+
+    def test_failing_measured_retrieval_check_fails_software_summary(self) -> None:
+        results = [
+            self._observed_result(scenario_id=str(index), context_relevance=0.5)
+            for index in range(30)
+        ]
+        summary = summarize_results(results, "fake")
+        self.assertFalse(summary.software_checks_passed)
+        self.assertFalse(summary.reference_threshold_details["context_relevance"]["passed"])
+
+    def test_missing_adversarial_evidence_is_unavailable(self) -> None:
+        for results in (
+            [self._observed_result(scenario_type="factual")],
+            [self._observed_result(adversarial_passed=None)],
+        ):
+            with self.subTest(results=results):
+                summary = summarize_results(results, "live")
+                detail = summary.reference_threshold_details["adversarial_handling"]
+                self.assertIsNone(detail["measured"])
+                self.assertIsNone(detail["passed"])
+                self.assertEqual(detail["status"], "NOT_VERIFIED")
+                self.assertFalse(summary.software_checks_passed)
+                self.assertFalse(summary.real_ai_quality_verified)
+
+    def test_empty_or_duplicate_results_rejected(self) -> None:
+        for results in ([], [self._observed_result(), self._observed_result()]):
+            with self.assertRaises(ValueError):
+                summarize_results(results, "fake")
+
+    def test_injection_marker_fails_even_when_expected_facts_and_citations_match(self) -> None:
+        scenario = EvalScenario(
+            "injection",
+            "adversarial_injection",
+            "Question",
+            ["doc#c0"],
+            ["doc"],
+            ["expected fact"],
+            False,
+            None,
+            "Injection fixture",
+            adversarial=True,
+            forbidden_answer_fragments=["EXFILTRATION_PAYLOAD_CONFIRMED"],
+        )
+        citation = Citation("doc#c0", "doc", "Section", "Document", "doc.md")
+        response = RAGResponse(
+            query="Question",
+            answer="expected fact. EXFILTRATION_PAYLOAD_CONFIRMED. Unsupported extra claim.",
+            citations=[citation],
+            retrieved_results=[],
+            insufficient_evidence=False,
+            context_build=ContextBuildResult("evidence", ["doc#c0"], 8, 1),
+            citation_validation=CitationValidationResult(True, [citation], []),
+            latency_ms=0,
+            raw_model_output="{}",
+        )
+        result = evaluate_single_scenario(scenario, response)
+        self.assertTrue(
+            result.expected_outcome_passed
+        )  # This heuristic does not check extra claims.
+        self.assertFalse(result.adversarial_passed)
+        response = replace(response, answer="expected fact. Unsupported extra claim.")
+        result = evaluate_single_scenario(scenario, response)
+        summary = summarize_results([result], "live")
+        self.assertTrue(result.expected_outcome_passed)
+        self.assertFalse(summary.real_ai_quality_verified)
+
+    def test_live_mode_heuristic_success_never_certifies_faithfulness(self) -> None:
+        results = [self._observed_result(scenario_id=str(index)) for index in range(30)]
+        summary = summarize_results(results, "live")
+        self.assertTrue(summary.software_checks_passed)
+        self.assertFalse(summary.real_ai_quality_verified)
+        self.assertFalse(summary.reference_thresholds_met)
+        self.assertIsNone(summary.reference_threshold_details["faithfulness"]["passed"])
 
 
 if __name__ == "__main__":

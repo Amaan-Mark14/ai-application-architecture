@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Union
+from typing import Any
 
 
 class JsonRpcErrorCode:
@@ -23,7 +24,7 @@ class JsonRpcError:
 
     code: int
     message: str
-    data: Optional[Any] = None
+    data: Any | None = None
 
     def to_dict(self) -> Mapping[str, Any]:
         payload: dict[str, Any] = {"code": self.code, "message": self.message}
@@ -37,8 +38,8 @@ class JsonRpcRequest:
     """JSON-RPC 2.0 request payload."""
 
     method: str
-    id: Union[str, int]
-    params: Optional[Mapping[str, Any]] = None
+    id: str | int
+    params: Mapping[str, Any] | None = None
     jsonrpc: str = "2.0"
 
     def to_dict(self) -> Mapping[str, Any]:
@@ -60,8 +61,10 @@ class JsonRpcRequest:
             raise ValueError(f"Invalid JSON-RPC version: {data.get('jsonrpc')}")
         if "method" not in data or not isinstance(data["method"], str):
             raise ValueError("Missing or invalid 'method' field in JSON-RPC request")
-        if "id" not in data:
+        if "id" not in data or type(data["id"]) not in (str, int):
             raise ValueError("Missing 'id' field in JSON-RPC request")
+        if "params" in data and not isinstance(data["params"], dict):
+            raise ValueError("Request params must be an object")
         return cls(
             method=data["method"],
             id=data["id"],
@@ -70,12 +73,34 @@ class JsonRpcRequest:
 
 
 @dataclass(frozen=True)
+class JsonRpcNotification:
+    """A notification has no request ID and must never receive a response."""
+
+    method: str
+    params: Mapping[str, Any] | None = None
+
+    def to_json(self) -> str:
+        payload: dict[str, Any] = {"jsonrpc": "2.0", "method": self.method}
+        if self.params is not None:
+            payload["params"] = dict(self.params)
+        return json.dumps(payload)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> JsonRpcNotification:
+        if data.get("jsonrpc") != "2.0" or "id" in data or not isinstance(data.get("method"), str):
+            raise ValueError("Invalid JSON-RPC notification")
+        if "params" in data and not isinstance(data["params"], dict):
+            raise ValueError("Notification params must be an object")
+        return cls(method=data["method"], params=data.get("params"))
+
+
+@dataclass(frozen=True)
 class JsonRpcResponse:
     """JSON-RPC 2.0 response payload."""
 
-    id: Union[str, int]
-    result: Optional[Any] = None
-    error: Optional[JsonRpcError] = None
+    id: str | int
+    result: Any | None = None
+    error: JsonRpcError | None = None
     jsonrpc: str = "2.0"
 
     def to_dict(self) -> Mapping[str, Any]:
@@ -93,12 +118,20 @@ class JsonRpcResponse:
     def from_dict(cls, data: Mapping[str, Any]) -> JsonRpcResponse:
         if data.get("jsonrpc") != "2.0":
             raise ValueError(f"Invalid JSON-RPC version: {data.get('jsonrpc')}")
-        if "id" not in data:
+        if "id" not in data or type(data["id"]) not in (str, int):
             raise ValueError("Missing 'id' field in JSON-RPC response")
+        if ("result" in data) == ("error" in data):
+            raise ValueError("Response must contain exactly one of result or error")
 
-        err: Optional[JsonRpcError] = None
-        if "error" in data and isinstance(data["error"], dict):
+        err: JsonRpcError | None = None
+        if "error" in data:
             err_dict = data["error"]
+            if (
+                not isinstance(err_dict, dict)
+                or type(err_dict.get("code")) is not int
+                or not isinstance(err_dict.get("message"), str)
+            ):
+                raise ValueError("Invalid JSON-RPC error object")
             err = JsonRpcError(
                 code=err_dict.get("code", JsonRpcErrorCode.INTERNAL_ERROR),
                 message=err_dict.get("message", "Unknown error"),

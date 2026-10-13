@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field
+from typing import Any, Literal
 
 from contracts.agent import (
     AgentActor,
@@ -16,18 +17,29 @@ from contracts.agent import (
 from contracts.validation import ValidationResult
 
 
+@dataclass(frozen=True)
+class StepFailure:
+    """The failed execution boundary, without inventing a model decision or receipt."""
+
+    stage: str
+    error_type: str
+    message: str
+
+
 @dataclass
 class AgentStepRecord:
     """Detailed audit record of an individual reasoning and action cycle."""
 
     step_number: int
-    decision: AgentDecision
-    validation_result: Optional[ValidationResult] = None
-    authorization_result: Optional[AuthorizationDecision] = None
-    approval_result: Optional[ApprovalDecision] = None
-    execution_receipt: Optional[ExecutionReceipt] = None
-    sanitized_observation: Optional[str] = None
+    decision: AgentDecision | None = None
+    validation_result: ValidationResult[Mapping[str, Any]] | None = None
+    authorization_result: AuthorizationDecision | None = None
+    approval_result: ApprovalDecision | None = None
+    execution_receipt: ExecutionReceipt | None = None
+    sanitized_observation: str | None = None
     step_latency_ms: float = 0.0
+    execution_kind: Literal["executed", "replayed", "rejected"] | None = None
+    failure: StepFailure | None = None
 
 
 @dataclass
@@ -37,9 +49,9 @@ class AgentTrajectoryTrace:
     run_id: str
     goal: str
     actor: AgentActor
-    steps: List[AgentStepRecord] = field(default_factory=list)
+    steps: list[AgentStepRecord] = field(default_factory=list)
     final_status: str = "PENDING"  # COMPLETED | NEEDS_CLARIFICATION | DENIED | REJECTED | FAILED | MAX_STEPS_REACHED
-    final_answer: Optional[str] = None
+    final_answer: str | None = None
     total_latency_ms: float = 0.0
     start_time: float = field(default_factory=time.time)
 
@@ -47,7 +59,7 @@ class AgentTrajectoryTrace:
         """Append an audited step record."""
         self.steps.append(step)
 
-    def complete(self, status: str, answer: Optional[str] = None) -> None:
+    def complete(self, status: str, answer: str | None = None) -> None:
         """Mark the trajectory as concluded with final outcome."""
         self.final_status = status
         self.final_answer = answer
@@ -57,11 +69,11 @@ class AgentTrajectoryTrace:
         """Produce safe structured audit dictionary without secret or PII leakage."""
         step_summaries = []
         for s in self.steps:
-            item: Dict[str, Any] = {
+            item: dict[str, Any] = {
                 "step": s.step_number,
-                "decision_type": s.decision.decision_type.value,
+                "decision_type": s.decision.decision_type.value if s.decision else None,
             }
-            if s.decision.action_name:
+            if s.decision and s.decision.action_name:
                 item["action"] = s.decision.action_name
             if s.authorization_result:
                 item["authorized"] = s.authorization_result.allowed
@@ -70,6 +82,9 @@ class AgentTrajectoryTrace:
             if s.execution_receipt:
                 item["execution_status"] = s.execution_receipt.status
                 item["receipt_id"] = s.execution_receipt.action_id
+                item["execution_kind"] = s.execution_kind
+            if s.failure:
+                item["failure"] = asdict(s.failure)
             step_summaries.append(item)
 
         return {

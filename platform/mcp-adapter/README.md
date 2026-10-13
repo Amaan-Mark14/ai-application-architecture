@@ -85,6 +85,7 @@ platform/mcp-adapter/
 ```python
 from mcp_adapter.adapter import McpCapabilityAdapter
 from mcp_adapter.client import McpClient
+from contracts.agent import SideEffectLevel
 
 # 1. Connect client to MCP server subprocess
 client = McpClient(command=["python3", "-m", "mcp_adapter.server"])
@@ -97,6 +98,7 @@ client.initialize()
 adapter = McpCapabilityAdapter(
     client=client,
     tool_name="get_system_status",
+    side_effect_level=SideEffectLevel.READ_ONLY,  # Trusted host configuration
     allowlist=["get_system_status"],  # Ping will be blocked
 )
 
@@ -106,6 +108,16 @@ print("System diagnostic output:", result)
 
 client.close()
 ```
+
+Both direct adapters and `create_mcp_capabilities(client, allowlist, side_effect_levels)` require explicit host-side side-effect classification. The factory's third argument is a mapping such as `{"get_system_status": SideEffectLevel.READ_ONLY}`; an incomplete mapping fails before discovery. Server annotations and tool names do not establish classification. Missing classification or an omitted allowlist rejects registration. `STATE_MUTATING` always requires approval; explicitly disabling approval is rejected. Allowlisting remains a separate restriction.
+
+### Supported lifecycle and transport limits
+
+The client supports MCP revision `2024-11-05` over stdio and the in-process reference transport. Initialization sends client capabilities, checks the negotiated revision/server metadata, and sends `notifications/initialized` before tool operations. Tool methods initialize lazily if needed. The reference server consumes notifications without responding to them.
+
+Stdio requests are serialized and responses must match the outstanding ID and its type. Intervening notifications are consumed without satisfying a request; server pings are answered and unadvertised client methods receive `METHOD_NOT_FOUND`. Notifications do not extend the request deadline. Dynamic tool-list updates and pagination are not implemented; paginated discovery is rejected explicitly.
+
+`McpClient(..., timeout_seconds=5.0)` sets a positive, finite request deadline covering channel acquisition and stdio writes/reads, including initialization and discovery. Reader/writer workers keep blocking pipe operations bounded; failed channels terminate their child and release workers/pipes so late responses cannot be reused. Messages are limited to 1,048,576 characters, with a bounded 256-message receive queue and UTF-8 pipe encoding. Child import paths use `os.pathsep`; inherited `PYTHONPATH` is retained. Child stderr is discarded rather than accumulated. These are transport bounds, not agent observation/context limits. In-process handlers execute synchronously and are intended for trusted local tests; their Python code cannot be forcibly preempted by the stdio deadline.
 
 ---
 

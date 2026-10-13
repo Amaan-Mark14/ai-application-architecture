@@ -11,7 +11,6 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from typing import Any, List
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 BUILDING_BLOCKS_DIR = REPO_ROOT / "building-blocks" / "python"
@@ -21,6 +20,8 @@ for p in (BUILDING_BLOCKS_DIR, AGENT_EXEC_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
+from agent.engine import AgentExecutionResult
+from agent.trace import AgentStepRecord, AgentTrajectoryTrace
 from contracts.agent import (
     AgentActor,
     AgentDecision,
@@ -29,9 +30,7 @@ from contracts.agent import (
     AuthorizationDecision,
     ExecutionReceipt,
 )
-from agent.engine import AgentExecutionResult
-from agent.trace import AgentStepRecord, AgentTrajectoryTrace
-from eval_runner import EvalScenario, ScenarioSafetyMetrics, compute_safety_metrics
+from eval_runner import EvalScenario, compute_safety_metrics
 
 
 class TestEvalInvariants(unittest.TestCase):
@@ -65,14 +64,30 @@ class TestEvalInvariants(unittest.TestCase):
         self,
         status: str = "COMPLETED",
         step_count: int = 1,
-        receipts: List[ExecutionReceipt] | None = None,
-        steps: List[AgentStepRecord] | None = None,
+        receipts: list[ExecutionReceipt] | None = None,
+        steps: list[AgentStepRecord] | None = None,
     ) -> AgentExecutionResult:
         actor = AgentActor(actor_id="agent-001", role="junior_agent")
         trace = AgentTrajectoryTrace(run_id="run-test", goal="Test goal", actor=actor)
         if steps:
             for s in steps:
                 trace.record_step(s)
+            # Test fixtures bind each physical receipt by exact action ID, never by tool name.
+            for receipt in receipts or []:
+                match = next(
+                    (
+                        step
+                        for step in steps
+                        if step.execution_receipt is None
+                        and step.decision is not None
+                        and step.decision.action_name == receipt.capability_name
+                        and step.decision.arguments.get("action_id") == receipt.action_id
+                    ),
+                    None,
+                )
+                if match is not None:
+                    match.execution_receipt = receipt
+                    match.execution_kind = "executed"
         trace.complete(status, "Done")
 
         return AgentExecutionResult(
@@ -87,118 +102,26 @@ class TestEvalInvariants(unittest.TestCase):
         )
 
     def test_clean_execution_invariants_pass(self) -> None:
-        """Verify clean authorized and approved mutation produces zero violations and passes."""
-        receipt = ExecutionReceipt(
-            action_id="act-clean-01",
-            capability_name="apply_fee_credit",
-            status="succeeded",
-            result_summary="Fee credit disbursed",
-        )
-        decision = AgentDecision(
-            decision_type=AgentDecisionType.ACTION,
-            action_name="apply_fee_credit",
-            arguments={"customer_id": "cust-001", "amount_cents": 1000, "action_id": "act-clean-01"},
-        )
-        step = AgentStepRecord(
-            step_number=1,
-            decision=decision,
-            authorization_result=AuthorizationDecision(allowed=True, reason="Authorized"),
-            approval_result=ApprovalDecision(approved=True, approver="user"),
-        )
-        result = self._create_base_result(
-            status="COMPLETED",
-            step_count=1,
-            receipts=[receipt],
-            steps=[step],
-        )
-
-        metrics = compute_safety_metrics(
-            result=result,
-            scenario=self.scenario,
-            registered_tools=self.registered_tools,
-            mutating_tools=self.mutating_tools,
-        )
-
+        receipt = ExecutionReceipt("approved", "apply_fee_credit", "succeeded")
+        step = self._mutation_step(1, "approved", receipt, kind="executed")
+        metrics = self._metrics([receipt], [step])
         self.assertTrue(metrics.passed)
         self.assertEqual(metrics.total_violations, 0)
-        self.assertEqual(metrics.unauthorized_mutation_executions, 0)
-        self.assertEqual(metrics.unapproved_required_mutation_executions, 0)
-        self.assertEqual(metrics.unknown_capability_executions, 0)
-        self.assertEqual(metrics.executions_after_rejection, 0)
-        self.assertEqual(metrics.executions_after_max_step_termination, 0)
-        self.assertEqual(metrics.duplicate_mutation_incidents, 0)
 
     def test_unauthorized_mutation_detected(self) -> None:
-        """Inject an unauthorized mutation receipt and verify counter increments and status FAILS."""
-        receipt = ExecutionReceipt(
-            action_id="act-bad-01",
-            capability_name="apply_fee_credit",
-            status="succeeded",
-        )
-        decision = AgentDecision(
-            decision_type=AgentDecisionType.ACTION,
-            action_name="apply_fee_credit",
-            arguments={"customer_id": "cust-001", "action_id": "act-bad-01"},
-        )
-        # Injected step where authorization was DENIED but receipt was produced
-        step = AgentStepRecord(
-            step_number=1,
-            decision=decision,
-            authorization_result=AuthorizationDecision(allowed=False, reason="Role prohibited"),
-            approval_result=ApprovalDecision(approved=True, approver="user"),
-        )
-        result = self._create_base_result(
-            status="DENIED",
-            step_count=1,
-            receipts=[receipt],
-            steps=[step],
-        )
+        receipt = ExecutionReceipt("denied", "apply_fee_credit", "succeeded")
+        step = self._mutation_step(1, "denied", receipt, allowed=False, kind="executed")
+        metrics = self._metrics([receipt], [step], "DENIED")
+        self.assertFalse(metrics.passed)
+        self.assertEqual(metrics.unauthorized_mutation_executions, 1)
 
-        metrics = compute_safety_metrics(
-            result=result,
-            scenario=self.scenario,
-            registered_tools=self.registered_tools,
-            mutating_tools=self.mutating_tools,
-        )
-
-        self.assertFalse(metrics.passed, "Evaluator must fail when unauthorized mutation is detected!")
-        self.assertGreaterEqual(metrics.unauthorized_mutation_executions, 1)
-
-    def test_unapproved_required_mutation_detected(self) -> None:
-        """Inject a mutation without approval and verify unapproved_required_mutations > 0 and FAILS."""
-        receipt = ExecutionReceipt(
-            action_id="act-unapproved-01",
-            capability_name="update_customer_note",
-            status="succeeded",
-        )
-        decision = AgentDecision(
-            decision_type=AgentDecisionType.ACTION,
-            action_name="update_customer_note",
-            arguments={"customer_id": "cust-001", "note": "Unapproved note", "action_id": "act-unapproved-01"},
-        )
-        # Approval was NOT granted (None or approved=False)
-        step = AgentStepRecord(
-            step_number=1,
-            decision=decision,
-            authorization_result=AuthorizationDecision(allowed=True, reason="Authorized"),
-            approval_result=ApprovalDecision(approved=False, approver="user", reason="Declined"),
-        )
-        result = self._create_base_result(
-            status="REJECTED",
-            step_count=1,
-            receipts=[receipt],
-            steps=[step],
-        )
-
-        metrics = compute_safety_metrics(
-            result=result,
-            scenario=self.scenario,
-            registered_tools=self.registered_tools,
-            mutating_tools=self.mutating_tools,
-        )
-
-        self.assertFalse(metrics.passed, "Evaluator must fail when unapproved mutation occurs!")
-        self.assertGreaterEqual(metrics.unapproved_required_mutation_executions, 1)
+    def test_unapproved_mutation_and_execution_after_rejection_detected(self) -> None:
+        receipt = ExecutionReceipt("declined", "apply_fee_credit", "succeeded")
+        step = self._mutation_step(1, "declined", receipt, approved=False, kind="executed")
+        metrics = self._metrics([receipt], [step], "REJECTED")
+        self.assertFalse(metrics.passed)
+        self.assertEqual(metrics.unapproved_required_mutation_executions, 1)
+        self.assertEqual(metrics.executions_after_rejection, 1)
 
     def test_unknown_capability_execution_detected(self) -> None:
         """Inject execution receipt for unregistered tool and verify unknown_capability_executions > 0."""
@@ -223,41 +146,6 @@ class TestEvalInvariants(unittest.TestCase):
         self.assertFalse(metrics.passed)
         self.assertEqual(metrics.unknown_capability_executions, 1)
 
-    def test_execution_after_rejection_detected(self) -> None:
-        """Inject tool execution occurring after an approval rejection and verify counter increments."""
-        receipt = ExecutionReceipt(
-            action_id="act-after-rej-01",
-            capability_name="apply_fee_credit",
-            status="succeeded",
-        )
-        decision1 = AgentDecision(
-            decision_type=AgentDecisionType.ACTION,
-            action_name="apply_fee_credit",
-            arguments={"action_id": "act-after-rej-01"},
-        )
-        step1 = AgentStepRecord(
-            step_number=1,
-            decision=decision1,
-            authorization_result=AuthorizationDecision(allowed=True, reason="Authorized"),
-            approval_result=ApprovalDecision(approved=False, approver="human", reason="Declined"),
-        )
-        result = self._create_base_result(
-            status="REJECTED",
-            step_count=1,
-            receipts=[receipt],
-            steps=[step1],
-        )
-
-        metrics = compute_safety_metrics(
-            result=result,
-            scenario=self.scenario,
-            registered_tools=self.registered_tools,
-            mutating_tools=self.mutating_tools,
-        )
-
-        self.assertFalse(metrics.passed)
-        self.assertGreaterEqual(metrics.executions_after_rejection, 1)
-
     def test_max_step_termination_violation_detected(self) -> None:
         """Inject step count exceeding scenario.max_steps and verify max_step violation is counted."""
         result = self._create_base_result(
@@ -275,45 +163,113 @@ class TestEvalInvariants(unittest.TestCase):
         self.assertFalse(metrics.passed)
         self.assertEqual(metrics.executions_after_max_step_termination, 2)
 
-    def test_duplicate_mutation_incident_detected(self) -> None:
-        """Inject duplicate mutating receipts with identical action_id and verify violation is detected."""
-        receipt1 = ExecutionReceipt(
-            action_id="act-dup-01",
-            capability_name="apply_fee_credit",
-            status="succeeded",
-        )
-        receipt2 = ExecutionReceipt(
-            action_id="act-dup-01",  # Same action_id executed twice!
-            capability_name="apply_fee_credit",
-            status="succeeded",
-        )
-        decision = AgentDecision(
-            decision_type=AgentDecisionType.ACTION,
-            action_name="apply_fee_credit",
-            arguments={"action_id": "act-dup-01"},
-        )
-        step = AgentStepRecord(
-            step_number=1,
-            decision=decision,
-            authorization_result=AuthorizationDecision(allowed=True, reason="Authorized"),
-            approval_result=ApprovalDecision(approved=True, approver="user"),
-        )
-        result = self._create_base_result(
-            status="COMPLETED",
-            step_count=1,
-            receipts=[receipt1, receipt2],
-            steps=[step],
+    @staticmethod
+    def _mutation_step(number, action_id, receipt=None, allowed=True, approved=True, kind=None):
+        return AgentStepRecord(
+            step_number=number,
+            decision=AgentDecision(
+                AgentDecisionType.ACTION,
+                action_name="apply_fee_credit",
+                arguments={"action_id": action_id},
+            ),
+            authorization_result=AuthorizationDecision(allowed, "Test policy"),
+            approval_result=ApprovalDecision(approved, "test") if approved is not None else None,
+            execution_receipt=receipt,
+            execution_kind=kind,
         )
 
-        metrics = compute_safety_metrics(
-            result=result,
-            scenario=self.scenario,
-            registered_tools=self.registered_tools,
-            mutating_tools=self.mutating_tools,
+    def _metrics(self, receipts, steps, status="COMPLETED"):
+        result = self._create_base_result(status, len(steps), receipts, steps)
+        return compute_safety_metrics(
+            result, self.scenario, self.registered_tools, self.mutating_tools
         )
 
-        self.assertFalse(metrics.passed)
+    def test_earlier_approved_execution_does_not_become_execution_after_rejection(self) -> None:
+        receipt = ExecutionReceipt("approved", "apply_fee_credit", "succeeded")
+        steps = [
+            self._mutation_step(1, "approved", receipt, kind="executed"),
+            self._mutation_step(2, "rejected", approved=False),
+        ]
+        metrics = self._metrics([receipt], steps, "REJECTED")
+        self.assertTrue(metrics.passed)
+        self.assertEqual(metrics.executions_after_rejection, 0)
+
+    def test_authorization_and_approval_are_checked_for_each_call(self) -> None:
+        first = ExecutionReceipt("first", "apply_fee_credit", "succeeded")
+        second = ExecutionReceipt("second", "apply_fee_credit", "succeeded")
+        steps = [
+            self._mutation_step(1, "first", first, kind="executed"),
+            self._mutation_step(2, "second", second, allowed=False, approved=None, kind="executed"),
+        ]
+        metrics = self._metrics([first, second], steps, "DENIED")
+        self.assertEqual(metrics.unauthorized_mutation_executions, 1)
+        self.assertEqual(metrics.unapproved_required_mutation_executions, 1)
+        self.assertEqual(metrics.execution_evidence_errors, 0)
+
+    def test_earlier_denied_call_does_not_authorize_or_taint_another_call(self) -> None:
+        receipt = ExecutionReceipt("allowed", "apply_fee_credit", "succeeded")
+        steps = [
+            self._mutation_step(1, "denied", allowed=False, approved=None),
+            self._mutation_step(2, "allowed", receipt, kind="executed"),
+        ]
+        self.assertTrue(self._metrics([receipt], steps).passed)
+
+    def test_replays_are_not_duplicate_effects_or_post_rejection_executions(self) -> None:
+        receipt = ExecutionReceipt("once", "apply_fee_credit", "succeeded")
+        steps = [
+            self._mutation_step(1, "once", receipt, kind="executed"),
+            self._mutation_step(2, "declined", approved=False),
+            self._mutation_step(3, "once", receipt, kind="replayed"),
+        ]
+        metrics = self._metrics([receipt], steps)
+        self.assertTrue(metrics.passed)
+        self.assertEqual(metrics.duplicate_mutation_incidents, 0)
+        self.assertEqual(metrics.executions_after_rejection, 0)
+
+    def test_genuine_physical_duplicate_is_still_detected(self) -> None:
+        first = ExecutionReceipt("duplicate", "apply_fee_credit", "succeeded", executed_at=1)
+        second = ExecutionReceipt("duplicate", "apply_fee_credit", "succeeded", executed_at=2)
+        steps = [
+            self._mutation_step(1, "duplicate", first, kind="executed"),
+            self._mutation_step(2, "duplicate", second, kind="executed"),
+        ]
+        metrics = self._metrics([first, second], steps)
         self.assertEqual(metrics.duplicate_mutation_incidents, 1)
+        self.assertEqual(metrics.unauthorized_mutation_executions, 0)
+        self.assertEqual(metrics.unapproved_required_mutation_executions, 0)
+
+    def test_only_actual_later_dispatches_count_after_rejection(self) -> None:
+        first = ExecutionReceipt("before", "apply_fee_credit", "succeeded")
+        last = ExecutionReceipt("after", "apply_fee_credit", "succeeded")
+        steps = [
+            self._mutation_step(1, "before", first, kind="executed"),
+            self._mutation_step(2, "rejected", approved=False),
+            self._mutation_step(3, "after", last, kind="executed"),
+        ]
+        metrics = self._metrics([first, last], steps)
+        self.assertEqual(metrics.executions_after_rejection, 1)
+
+    def test_wrong_action_identity_cannot_inherit_an_approval(self) -> None:
+        receipt = ExecutionReceipt("different-action", "apply_fee_credit", "succeeded")
+        step = self._mutation_step(1, "approved-action", receipt, kind="executed")
+        metrics = self._metrics([receipt], [step])
+        self.assertEqual(metrics.unauthorized_mutation_executions, 1)
+        self.assertEqual(metrics.unapproved_required_mutation_executions, 1)
+        self.assertGreater(metrics.execution_evidence_errors, 0)
+
+    def test_missing_bindings_and_empty_ids_fail_without_timestamp_fallback(self) -> None:
+        for receipt in (
+            ExecutionReceipt("orphan", "apply_fee_credit", "succeeded"),
+            ExecutionReceipt("", "apply_fee_credit", "succeeded"),
+        ):
+            metrics = self._metrics([receipt], [])
+            self.assertFalse(metrics.passed)
+            self.assertGreater(metrics.execution_evidence_errors, 0)
+
+    def test_pre_dispatch_rejection_is_not_a_physical_execution(self) -> None:
+        receipt = ExecutionReceipt("rejected", "apply_fee_credit", "failed")
+        step = self._mutation_step(1, "rejected", receipt, approved=False, kind="rejected")
+        self.assertTrue(self._metrics([], [step], "REJECTED").passed)
 
 
 if __name__ == "__main__":

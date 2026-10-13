@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
+from typing import Any
 
-from contracts.agent import CapabilityMetadata, CapabilityPort
+from contracts.agent import CapabilityMetadata, CapabilityPort, SideEffectLevel
 from contracts.validation import ValidationResult
+
+from .schema import validate_schema, validate_value
 
 
 class CapabilityRegistry:
@@ -15,8 +19,9 @@ class CapabilityRegistry:
     from explicitly registered, approved capabilities.
     """
 
-    def __init__(self, capabilities: Optional[Sequence[CapabilityPort]] = None) -> None:
-        self._capabilities: Dict[str, CapabilityPort] = {}
+    def __init__(self, capabilities: Sequence[CapabilityPort] | None = None) -> None:
+        self._capabilities: dict[str, CapabilityPort] = {}
+        self._schemas: dict[str, Mapping[str, Any]] = {}
         if capabilities:
             for cap in capabilities:
                 self.register(cap)
@@ -26,13 +31,16 @@ class CapabilityRegistry:
         name = capability.metadata.name
         if name in self._capabilities:
             raise ValueError(f"Capability '{name}' is already registered in registry")
+        validate_schema(capability.metadata.input_schema)
+        schema = deepcopy(capability.metadata.input_schema)
         self._capabilities[name] = capability
+        self._schemas[name] = schema
 
     def is_registered(self, name: str) -> bool:
         """Check if capability identifier exists in allowlisted registry."""
         return name in self._capabilities
 
-    def get(self, name: str) -> Optional[CapabilityPort]:
+    def get(self, name: str) -> CapabilityPort | None:
         """Resolve capability by name."""
         return self._capabilities.get(name)
 
@@ -42,18 +50,21 @@ class CapabilityRegistry:
 
     def get_tool_definitions_prompt(self) -> str:
         """Generate human-readable, model-facing capability specifications for reasoning context."""
-        lines: List[str] = []
+        lines: list[str] = []
         for meta in self.list_capabilities():
+            schema = self._schemas[meta.name]
             lines.append(f"• Tool: {meta.name}")
             lines.append(f"  Description: {meta.description}")
             lines.append(f"  Side Effect: {meta.side_effect_level.value.upper()}")
             lines.append(f"  Approval Required: {meta.requires_approval}")
-            lines.append(f"  Required Arguments: {meta.input_schema.get('required', [])}")
-            lines.append(f"  Parameters Schema: {meta.input_schema.get('properties', {})}")
+            lines.append(f"  Required Arguments: {schema.get('required', [])}")
+            lines.append(f"  Parameters Schema: {schema.get('properties', {})}")
             lines.append("")
         return "\n".join(lines).strip()
 
-    def validate_arguments(self, capability_name: str, arguments: Mapping[str, Any]) -> ValidationResult:
+    def validate_arguments(
+        self, capability_name: str, arguments: Mapping[str, Any]
+    ) -> ValidationResult[Mapping[str, Any]]:
         """Perform strict deterministic schema validation on model-proposed capability arguments.
 
         Validates required parameter presence, data types, and prohibits unknown fields.
@@ -62,38 +73,14 @@ class CapabilityRegistry:
         if not capability:
             return ValidationResult(
                 is_valid=False,
-                errors=[f"Unknown capability '{capability_name}'. Tool is not present in registered allowlist."],
+                errors=[
+                    f"Unknown capability '{capability_name}'. Tool is not present in registered allowlist."
+                ],
             )
 
-        schema = capability.metadata.input_schema
-        errors: List[str] = []
-
-        # 1. Check required properties
-        required_fields = schema.get("required", [])
-        for field_name in required_fields:
-            if field_name not in arguments:
-                errors.append(f"Missing required parameter '{field_name}' for capability '{capability_name}'")
-
-        # 2. Check property types
-        properties: Mapping[str, Any] = schema.get("properties", {})
-        for prop_name, prop_val in arguments.items():
-            if prop_name not in properties:
-                if schema.get("additionalProperties") is False:
-                    errors.append(f"Unexpected parameter '{prop_name}' is not allowed for capability '{capability_name}'")
-                continue
-
-            expected_type = properties[prop_name].get("type")
-            if expected_type == "string" and not isinstance(prop_val, str):
-                errors.append(f"Parameter '{prop_name}' must be a string, got {type(prop_val).__name__}")
-            elif expected_type == "integer" and (not isinstance(prop_val, int) or isinstance(prop_val, bool)):
-                errors.append(f"Parameter '{prop_name}' must be an integer, got {type(prop_val).__name__}")
-            elif expected_type == "number" and not isinstance(prop_val, (int, float)):
-                errors.append(f"Parameter '{prop_name}' must be a number, got {type(prop_val).__name__}")
-            elif expected_type == "boolean" and not isinstance(prop_val, bool):
-                errors.append(f"Parameter '{prop_name}' must be a boolean, got {type(prop_val).__name__}")
-            elif expected_type == "array" and not isinstance(prop_val, (list, tuple)):
-                errors.append(f"Parameter '{prop_name}' must be a list, got {type(prop_val).__name__}")
-            elif expected_type == "object" and not isinstance(prop_val, dict):
-                errors.append(f"Parameter '{prop_name}' must be an object, got {type(prop_val).__name__}")
-
+        errors = validate_value(self._schemas[capability_name], arguments)
+        if capability.metadata.side_effect_level == SideEffectLevel.STATE_MUTATING:
+            action_id = arguments.get("action_id") if isinstance(arguments, Mapping) else None
+            if not isinstance(action_id, str) or not action_id.strip():
+                errors.append("Mutating capabilities require a non-empty string action_id")
         return ValidationResult(is_valid=len(errors) == 0, errors=errors)

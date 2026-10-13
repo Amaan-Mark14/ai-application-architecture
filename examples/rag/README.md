@@ -179,7 +179,7 @@ python3 examples/rag/benchmark_preparation.py --documents 100 1000
 This benchmark uses model doubles and temporary local SQLite; preparation timings include `tracemalloc` overhead and search timings are measured after tracing stops. It measures software behavior, not real embedding throughput, RSS memory, model quality or representative production capacity. Measure your actual corpus/models before selecting ANN or a persistent vector service.
 
 ### 6.3 Automated Reference AI Evaluation
-Execute the versioned 32-scenario evaluation dataset (`eval_dataset.jsonl`) measuring retrieval and grounded generation metrics. (Note: Per [`QUALITY-GATES.md`](../../QUALITY-GATES.md#gate-d--ai-evaluation), Gate D is mandatory for Tier 1 Reference Applications; this Tier 2 Pattern Example executes evaluation as a voluntary reference quality benchmark):
+Execute the versioned 32-scenario evaluation dataset (`eval_dataset.jsonl`) measuring retrieval, schema adherence, citation identity, expected-outcome heuristics and abstention. Per [`QUALITY-GATES.md`](../../QUALITY-GATES.md#gate-d--ai-evaluation), Gate D is mandatory for Tier 1 Reference Applications; this Tier 2 Pattern Example executes a voluntary software benchmark.
 
 ```bash
 python3 examples/rag/eval_runner.py --mode fake
@@ -195,10 +195,15 @@ python3 examples/rag/eval_runner.py --mode fake
 | **Mean Reciprocal Rank (MRR)** | N/A | **0.938** | PASS |
 | **Context Relevance** | $\ge 0.80$ | **0.859 (85.9%)** | PASS |
 | **Schema Adherence** | $\ge 0.98$ | **1.000 (100.0%)** | PASS |
-| **Groundedness / Faithfulness** | $\ge 0.85$ | **1.000 (100.0%)** | PASS |
+| **Expected Outcome Heuristic** | N/A | **1.000 (100.0%)** | Software check only |
+| **Claim-level Faithfulness** | $\ge 0.85$ | Not measured | NOT VERIFIED |
 | **Citation Accuracy** | N/A | **100.0%** | PASS |
 | **Abstention Accuracy** | N/A | **100.0%** | PASS |
-| **Adversarial Robustness** | Handled | **100.0%** | PASS |
+| **Declared Adversarial Checks** | All identified cases | Derived from observed outcomes | Limited scenario checks |
+
+The outcome heuristic checks accepted schema/citations plus expected-fact substrings, or the expected abstention. It can accept additional unsupported claims; it is not factual entailment. Citation accuracy checks source identity only. Adversarial scenarios explicitly declare `adversarial=true` and optional `forbidden_answer_fragments`; their observed outcome and forbidden-fragment checks determine each verdict. Missing cases or missing declarations produce unavailable evidence (`measured=null`, `passed=null`), never an automatic pass.
+
+Reports use `expected_outcome_passed`/`expected_outcome_rate` instead of the former `grounded`/`groundedness_rate` names. `software_checks_passed` controls deterministic CLI success; `reference_thresholds_met` and `real_ai_quality_verified` remain false while reviewed claim-level faithfulness is unavailable, even on live execution. The historical canonical report is retained as an old harness snapshot and is not current factual-quality evidence. No real-model or representative-capacity validation is established by these checks.
 
 ---
 

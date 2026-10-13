@@ -520,8 +520,9 @@ Phase 5 implements a 32-scenario reference evaluation harness ([`examples/rag/ev
 | **MRR** | Retrieval | Mean Reciprocal Rank ($1/\text{rank}$) of the first relevant chunk. | N/A |
 | **Context Relevance** | Retrieval | Fraction of retrieved chunks that were pertinent to the query. | $\ge 0.80$ |
 | **Schema Adherence** | Generation | Fraction of model responses that parsed into valid JSON matching the schema. | $\ge 0.98$ |
-| **Groundedness** | Generation | Fraction of answers containing expected facts and zero unsupported claims. | $\ge 0.85$ |
-| **Citation Accuracy** | Verification | Fraction of claimed citations that were valid and pertinent. | N/A |
+| **Expected Outcome Heuristic** | Generation | Accepted schema/citations and expected-fact substrings, or expected abstention; extra unsupported claims are not checked. | N/A |
+| **Claim-level Faithfulness** | Generation | Requires reviewed support for individual generated claims; currently unmeasured. | $\ge 0.85$ |
+| **Citation Accuracy** | Verification | Fraction of claimed citations matching supplied source identities; does not establish factual support. | N/A |
 | **Abstention Accuracy**| Governance | Fraction of out-of-domain / adversarial queries correctly refused. | N/A |
 
 ### Architectural Policy Modes vs CLI Execution Modes
@@ -541,7 +542,7 @@ To evaluate and reason about RAG systems accurately, architects must distinguish
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-The Phase 5 reference implementation is designed and validated under **Mode A (Offline Local)**: the entire pipeline—vector indexing, dense embedding generation, and language model inference—runs locally on the developer workstation without cloud egress or paid API keys.
+The Phase 5 reference implementation supports **Mode A (Offline Local)** without cloud keys. Executed deterministic checks validate software behavior with test doubles; actual local-model quality and representative capacity remain unverified.
 
 Within that architectural boundary, `eval_runner.py` provides two distinct execution modes:
 
@@ -554,7 +555,8 @@ Within that architectural boundary, `eval_runner.py` provides two distinct execu
   {
     "mode": "fake",
     "harness_passed": true,
-    "reference_thresholds_met": true,
+    "software_checks_passed": true,
+    "reference_thresholds_met": false,
     "real_ai_quality_verified": false,
     "gate_d_applicable": false,
     "gate_d_status": "NOT_APPLICABLE"
@@ -563,12 +565,12 @@ Within that architectural boundary, `eval_runner.py` provides two distinct execu
 
 #### 2. Live Local Mode (`--mode live`)
 * **What it runs**: Real local Ollama daemon at `http://localhost:11434` hosting open-weights models (`nomic-embed-text` and `llama3.2`).
-* **What it proves**: Real probabilistic model quality, semantic vector retrieval accuracy, and grounded generation adherence on the local machine under Mode A policy.
-* **Evidence Semantics**: If all reference thresholds are met on live execution, `real_ai_quality_verified` is set to `True`.
+* **What it measures**: Observed local-model responses, retrieval results and schema/citation/expected-outcome checks. Live execution alone does not establish claim-level factual support.
+* **Evidence Semantics**: `real_ai_quality_verified` and `reference_thresholds_met` remain false while reviewed claim-level faithfulness is unavailable. Deterministic CLI success uses `software_checks_passed`; missing adversarial evidence is unavailable, not a pass. See the [evaluation contract](../../examples/rag/README.md#63-automated-reference-ai-evaluation).
 
 ### Result Artifact Policy
 * **Transient Timestamped Reports**: CLI runs write `eval_report_<timestamp>.json` into `examples/rag/results/`. These files are ignored by version control in [`.gitignore`](../../.gitignore) to prevent repository churn.
-* **Stable Canonical Evidence**: The repository maintains a single version-controlled baseline report at [`examples/rag/results/canonical_eval_report.json`](../../examples/rag/results/canonical_eval_report.json).
+* **Historical Canonical Snapshot**: The old report predates the corrected scoring labels and is not current faithfulness/adversarial-quality evidence: [`examples/rag/results/canonical_eval_report.json`](../../examples/rag/results/canonical_eval_report.json).
 
 ### Quality Gate Applicability (Gate D)
 Per [`QUALITY-GATES.md`](../../QUALITY-GATES.md#gate-d--ai-evaluation):

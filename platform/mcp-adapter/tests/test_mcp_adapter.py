@@ -6,7 +6,6 @@ import asyncio
 import sys
 import unittest
 from pathlib import Path
-from typing import Any, Mapping
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 BUILDING_BLOCKS_DIR = REPO_ROOT / "building-blocks" / "python"
@@ -103,6 +102,7 @@ class TestMcpCapabilityAdapter(unittest.TestCase):
         adapter = McpCapabilityAdapter(
             client=self.client,
             tool_name="get_system_status",
+            side_effect_level=SideEffectLevel.READ_ONLY,
             allowlist=["get_system_status"],
         )
         self.assertIsInstance(adapter, CapabilityPort)
@@ -116,6 +116,7 @@ class TestMcpCapabilityAdapter(unittest.TestCase):
             McpCapabilityAdapter(
                 client=self.client,
                 tool_name="ping",
+                side_effect_level=SideEffectLevel.READ_ONLY,
                 allowlist=["get_system_status"],
             )
         self.assertIn("is not present in permitted allowlist", str(ctx.exception))
@@ -124,6 +125,7 @@ class TestMcpCapabilityAdapter(unittest.TestCase):
         adapter = McpCapabilityAdapter(
             client=self.client,
             tool_name="get_system_status",
+            side_effect_level=SideEffectLevel.READ_ONLY,
             allowlist=["get_system_status"],
         )
         result = asyncio.run(adapter.execute({}))
@@ -136,6 +138,7 @@ class TestMcpCapabilityAdapter(unittest.TestCase):
         capabilities = create_mcp_capabilities(
             client=self.client,
             allowlist=["get_system_status"],
+            side_effect_levels={"get_system_status": SideEffectLevel.READ_ONLY},
         )
         self.assertEqual(len(capabilities), 1)
         self.assertEqual(capabilities[0].metadata.name, "get_system_status")
@@ -175,6 +178,7 @@ class TestMcpTimeoutAndResponsiveness(unittest.IsolatedAsyncioTestCase):
         adapter = McpCapabilityAdapter(
             client=client,
             tool_name="stalled_tool",
+            side_effect_level=SideEffectLevel.READ_ONLY,
             description="Stalled capability",
             input_schema={},
             allowlist=["stalled_tool"],
@@ -199,7 +203,9 @@ class TestMcpTimeoutAndResponsiveness(unittest.IsolatedAsyncioTestCase):
         await ticker_task
 
         # 1. Bounded preemption: elapsed time must be bounded around 0.25s, well under 1.0s
-        self.assertLess(elapsed, 0.8, f"Execution blocked for {elapsed:.2f}s instead of timing out at 0.25s")
+        self.assertLess(
+            elapsed, 0.8, f"Execution blocked for {elapsed:.2f}s instead of timing out at 0.25s"
+        )
         self.assertGreaterEqual(elapsed, 0.20)
 
         # 2. Event loop was responsive: background task progressed concurrently

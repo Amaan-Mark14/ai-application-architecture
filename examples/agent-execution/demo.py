@@ -8,7 +8,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 BUILDING_BLOCKS_DIR = REPO_ROOT / "building-blocks" / "python"
@@ -19,7 +19,6 @@ for p in (BUILDING_BLOCKS_DIR, PLATFORM_OLLAMA_DIR, AGENT_EXEC_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from contracts.agent import AgentActor, ApprovalPort
 from agent.approval import CliApprovalHandler, DeterministicApprovalHandler
 from agent.capabilities import (
     ApplyFeeCreditCapability,
@@ -34,26 +33,32 @@ from agent.executor import ToolExecutor
 from agent.policy import CustomerSupportAuthorizationPolicy
 from agent.registry import CapabilityRegistry
 from agent.test_doubles import ScriptedGenerationStub
+from contracts.agent import AgentActor, ApprovalPort
+from contracts.ports import TextGenerationPort
 from ollama_adapter.adapter import OllamaAdapter
 
-SCENARIOS: Dict[str, Dict[str, Any]] = {
+SCENARIOS: dict[str, dict[str, Any]] = {
     "read": {
         "description": "Inspect customer profile for Alice Smith (cust-001)",
         "goal": "Inspect account and risk profile for customer cust-001",
         "actor": AgentActor(actor_id="agent-alice", role="junior_agent"),
         "approval_response": True,
         "canned_responses": [
-            json.dumps({
-                "type": "action",
-                "action_name": "get_customer",
-                "arguments": {"customer_id": "cust-001"},
-                "explanation": "Looking up customer profile for cust-001",
-            }),
-            json.dumps({
-                "type": "final",
-                "final_answer": "Customer Alice Smith is active with low risk tier and active account status.",
-                "explanation": "Verified records",
-            }),
+            json.dumps(
+                {
+                    "type": "action",
+                    "action_name": "get_customer",
+                    "arguments": {"customer_id": "cust-001"},
+                    "explanation": "Looking up customer profile for cust-001",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "final",
+                    "final_answer": "Customer Alice Smith is active with low risk tier and active account status.",
+                    "explanation": "Verified records",
+                }
+            ),
         ],
     },
     "multi-read": {
@@ -62,23 +67,29 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "actor": AgentActor(actor_id="agent-alice", role="junior_agent"),
         "approval_response": True,
         "canned_responses": [
-            json.dumps({
-                "type": "action",
-                "action_name": "get_customer",
-                "arguments": {"customer_id": "cust-001"},
-                "explanation": "Check customer identity",
-            }),
-            json.dumps({
-                "type": "action",
-                "action_name": "get_account_status",
-                "arguments": {"customer_id": "cust-001"},
-                "explanation": "Retrieve account balance and activity",
-            }),
-            json.dumps({
-                "type": "final",
-                "final_answer": "Customer Alice Smith is active with low risk. Account balance is $150.00 with 2 recent transactions.",
-                "explanation": "Combined profile and balance",
-            }),
+            json.dumps(
+                {
+                    "type": "action",
+                    "action_name": "get_customer",
+                    "arguments": {"customer_id": "cust-001"},
+                    "explanation": "Check customer identity",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "action",
+                    "action_name": "get_account_status",
+                    "arguments": {"customer_id": "cust-001"},
+                    "explanation": "Retrieve account balance and activity",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "final",
+                    "final_answer": "Customer Alice Smith is active with low risk. Account balance is $150.00 with 2 recent transactions.",
+                    "explanation": "Combined profile and balance",
+                }
+            ),
         ],
     },
     "mutation-approve": {
@@ -87,22 +98,26 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "actor": AgentActor(actor_id="agent-alice", role="junior_agent"),
         "approval_response": True,
         "canned_responses": [
-            json.dumps({
-                "type": "action",
-                "action_name": "apply_fee_credit",
-                "arguments": {
-                    "customer_id": "cust-001",
-                    "amount_cents": 1500,
-                    "reason": "Late fee dispute resolution",
-                    "action_id": "demo-act-001",
-                },
-                "explanation": "Proposing $15 credit within junior agent threshold",
-            }),
-            json.dumps({
-                "type": "final",
-                "final_answer": "A fee credit of $15.00 has been successfully approved and applied to customer cust-001. New balance is $165.00.",
-                "explanation": "Confirmed via execution receipt",
-            }),
+            json.dumps(
+                {
+                    "type": "action",
+                    "action_name": "apply_fee_credit",
+                    "arguments": {
+                        "customer_id": "cust-001",
+                        "amount_cents": 1500,
+                        "reason": "Late fee dispute resolution",
+                        "action_id": "demo-act-001",
+                    },
+                    "explanation": "Proposing $15 credit within junior agent threshold",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "final",
+                    "final_answer": "A fee credit of $15.00 has been successfully approved and applied to customer cust-001. New balance is $165.00.",
+                    "explanation": "Confirmed via execution receipt",
+                }
+            ),
         ],
     },
     "mutation-reject": {
@@ -111,17 +126,19 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "actor": AgentActor(actor_id="agent-alice", role="junior_agent"),
         "approval_response": False,
         "canned_responses": [
-            json.dumps({
-                "type": "action",
-                "action_name": "apply_fee_credit",
-                "arguments": {
-                    "customer_id": "cust-001",
-                    "amount_cents": 1500,
-                    "reason": "Customer courtesy credit",
-                    "action_id": "demo-act-002",
-                },
-                "explanation": "Proposing fee credit",
-            }),
+            json.dumps(
+                {
+                    "type": "action",
+                    "action_name": "apply_fee_credit",
+                    "arguments": {
+                        "customer_id": "cust-001",
+                        "amount_cents": 1500,
+                        "reason": "Customer courtesy credit",
+                        "action_id": "demo-act-002",
+                    },
+                    "explanation": "Proposing fee credit",
+                }
+            ),
         ],
     },
     "denied": {
@@ -130,17 +147,19 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "actor": AgentActor(actor_id="agent-alice", role="junior_agent"),
         "approval_response": True,
         "canned_responses": [
-            json.dumps({
-                "type": "action",
-                "action_name": "apply_fee_credit",
-                "arguments": {
-                    "customer_id": "cust-001",
-                    "amount_cents": 3500,
-                    "reason": "Service concession",
-                    "action_id": "demo-act-003",
-                },
-                "explanation": "Proposing $35 credit",
-            }),
+            json.dumps(
+                {
+                    "type": "action",
+                    "action_name": "apply_fee_credit",
+                    "arguments": {
+                        "customer_id": "cust-001",
+                        "amount_cents": 3500,
+                        "reason": "Service concession",
+                        "action_id": "demo-act-003",
+                    },
+                    "explanation": "Proposing $35 credit",
+                }
+            ),
         ],
     },
     "frozen": {
@@ -149,16 +168,18 @@ SCENARIOS: Dict[str, Dict[str, Any]] = {
         "actor": AgentActor(actor_id="agent-bob", role="senior_agent"),
         "approval_response": True,
         "canned_responses": [
-            json.dumps({
-                "type": "action",
-                "action_name": "update_customer_note",
-                "arguments": {
-                    "customer_id": "cust-003",
-                    "note": "Customer contacted support via web chat",
-                    "action_id": "demo-act-004",
-                },
-                "explanation": "Appending note",
-            }),
+            json.dumps(
+                {
+                    "type": "action",
+                    "action_name": "update_customer_note",
+                    "arguments": {
+                        "customer_id": "cust-003",
+                        "note": "Customer contacted support via web chat",
+                        "action_id": "demo-act-004",
+                    },
+                    "explanation": "Appending note",
+                }
+            ),
         ],
     },
 }
@@ -203,6 +224,7 @@ async def run_demo(
 
     executor = ToolExecutor()
 
+    llm_client: TextGenerationPort
     if mode == "fake":
         llm_client = ScriptedGenerationStub(sc["canned_responses"])
     else:
@@ -225,8 +247,10 @@ async def run_demo(
     print("-" * 70)
     for s in result.trace.steps:
         print(f"Step {s.step_number}:")
-        print(f"  Decision Type: {s.decision.decision_type.value.upper()}")
-        if s.decision.action_name:
+        print(
+            f"  Decision Type: {s.decision.decision_type.value.upper() if s.decision else 'NONE'}"
+        )
+        if s.decision and s.decision.action_name:
             print(f"  Action Name:   {s.decision.action_name}")
             print(f"  Arguments:     {s.decision.arguments}")
         if s.authorization_result:
@@ -236,7 +260,12 @@ async def run_demo(
             app_str = "APPROVED" if s.approval_result.approved else "REJECTED"
             print(f"  Approval:      [{app_str}] Approver: {s.approval_result.approver}")
         if s.execution_receipt:
-            print(f"  Receipt ID:    {s.execution_receipt.action_id} (Status: {s.execution_receipt.status.upper()})")
+            print(
+                f"  Receipt ID:    {s.execution_receipt.action_id} (Status: {s.execution_receipt.status.upper()})"
+            )
+            print(f"  Dispatch Kind: {s.execution_kind}")
+        if s.failure:
+            print(f"  Failure:       {s.failure.stage} ({s.failure.error_type})")
         print(f"  Step Latency:  {s.step_latency_ms:.1f}ms")
         print()
 
@@ -257,19 +286,27 @@ def main() -> None:
         default="mutation-approve",
         help="Pre-configured scenario to execute",
     )
-    parser.add_argument("--mode", choices=["fake", "live"], default="fake", help="Execution mode (fake or live)")
-    parser.add_argument("--interactive", action="store_true", help="Prompt human operator on stdin for approvals")
+    parser.add_argument(
+        "--mode", choices=["fake", "live"], default="fake", help="Execution mode (fake or live)"
+    )
+    parser.add_argument(
+        "--interactive", action="store_true", help="Prompt human operator on stdin for approvals"
+    )
     parser.add_argument("--model", default="llama3.2", help="Model name for live Ollama mode")
-    parser.add_argument("--endpoint", default="http://localhost:11434", help="Ollama daemon HTTP endpoint")
+    parser.add_argument(
+        "--endpoint", default="http://localhost:11434", help="Ollama daemon HTTP endpoint"
+    )
 
     args = parser.parse_args()
-    asyncio.run(run_demo(
-        scenario_name=args.scenario,
-        mode=args.mode,
-        interactive=args.interactive,
-        model=args.model,
-        endpoint=args.endpoint,
-    ))
+    asyncio.run(
+        run_demo(
+            scenario_name=args.scenario,
+            mode=args.mode,
+            interactive=args.interactive,
+            model=args.model,
+            endpoint=args.endpoint,
+        )
+    )
 
 
 if __name__ == "__main__":
