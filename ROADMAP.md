@@ -158,13 +158,14 @@ Workflows   Intel       Intel       Real-Time   Synthesis   Intel & Plat Audit  
 ---
 
 ## Phase 7: Agentic Workflow Orchestration
-* **Objective**: Build durable multi-agent workflows, human-in-the-loop gates, and persistent state management.
+* **Objective**: Coordinate one bounded, read-only agent within a deterministic workflow with durable approval checkpoints, following [ADR-0009](adr/0009-agentic-workflow-orchestration-and-roadmap-reconciliation.md).
 * **Scope**:
-  * Multi-agent collaborative workflow application (Tier 1).
-  * Durable state machine orchestration and saga compensation.
-  * Human-in-the-loop asynchronous pause/resume checkpoints.
+  * Customer account remediation pattern example (Tier 2), using standard-library Python and SQLite.
+  * Application-controlled state transitions, bounded read-only investigation, durable mutation receipts, and local compensation handlers.
+  * Human-in-the-loop asynchronous approval pause/resume checkpoints with current authorization and approval binding checks.
+  * Multi-agent collaboration, distributed workflow engines, and production identity-provider integration remain deferred as recorded in ADR-0009.
 * **Dependencies**: Phase 6.
-* **Exit Criteria**: Workflow survives process restart without state loss; human approval checkpoint functions asynchronously.
+* **Exit Criteria**: Demonstrate approval suspension and resumption across separate local processes; meet Tier 2 Gates B, C, H, and I. Local interrupted-execution recovery, durable action-bound business operations, and the note-then-credit compensation sequence are implemented with deterministic restart/failure regressions; independent acceptance and live-model quality remain unverified.
 
 ---
 

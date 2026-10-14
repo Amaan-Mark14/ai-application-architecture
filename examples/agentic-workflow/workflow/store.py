@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib
 import json
+import os
 import sqlite3
 import time
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any
 
 from contracts.workflow import (
-    ApprovalStatus,
     CheckpointStorePort,
-    MutationStatus,
     WorkflowStatus,
 )
 
@@ -26,11 +29,11 @@ class InMemoryWorkflowStore(CheckpointStorePort):
     """Hermetic in-memory store for unit tests and rapid evaluation."""
 
     def __init__(self) -> None:
-        self.checkpoints: Dict[str, WorkflowState] = {}
-        self.approvals: Dict[str, DurableApprovalRecord] = {}
-        self.approvals_by_action: Dict[str, str] = {}
-        self.mutations: Dict[str, DurableMutationRecord] = {}
-        self.audit_events: List[WorkflowAuditEvent] = []
+        self.checkpoints: dict[str, WorkflowState] = {}
+        self.approvals: dict[str, DurableApprovalRecord] = {}
+        self.approvals_by_action: dict[str, str] = {}
+        self.mutations: dict[str, DurableMutationRecord] = {}
+        self.audit_events: list[WorkflowAuditEvent] = []
 
     async def save_checkpoint(
         self,
@@ -44,7 +47,7 @@ class InMemoryWorkflowStore(CheckpointStorePort):
     async def load_checkpoint(
         self,
         workflow_id: str,
-    ) -> Optional[Mapping[str, Any]]:
+    ) -> Mapping[str, Any] | None:
         state = self.load_state(workflow_id)
         return state.to_dict() if state else None
 
@@ -52,12 +55,14 @@ class InMemoryWorkflowStore(CheckpointStorePort):
         state_with_checksum = state.with_updated_checksum()
         self.checkpoints[state.workflow_id] = state_with_checksum
 
-    def load_state(self, workflow_id: str) -> Optional[WorkflowState]:
+    def load_state(self, workflow_id: str) -> WorkflowState | None:
         state = self.checkpoints.get(workflow_id)
         if state is None:
             return None
         if state.compute_checksum() != state.checksum:
-            raise CorruptedCheckpointError(f"Integrity checksum verification failed for workflow '{workflow_id}'.")
+            raise CorruptedCheckpointError(
+                f"Integrity checksum verification failed for workflow '{workflow_id}'."
+            )
         return state
 
     def compare_and_swap_resume(
@@ -69,7 +74,10 @@ class InMemoryWorkflowStore(CheckpointStorePort):
         state = self.checkpoints.get(workflow_id)
         if not state:
             return False
-        if state.checkpoint_version == expected_version and state.status == WorkflowStatus.AWAITING_APPROVAL:
+        if (
+            state.checkpoint_version == expected_version
+            and state.status == WorkflowStatus.AWAITING_APPROVAL
+        ):
             updated = WorkflowState(
                 workflow_id=state.workflow_id,
                 definition=state.definition,
@@ -93,17 +101,17 @@ class InMemoryWorkflowStore(CheckpointStorePort):
         self.approvals[record.approval_id] = record
         self.approvals_by_action[record.action_id] = record.approval_id
 
-    def load_approval(self, approval_id: str) -> Optional[DurableApprovalRecord]:
+    def load_approval(self, approval_id: str) -> DurableApprovalRecord | None:
         return self.approvals.get(approval_id)
 
-    def load_approval_by_action_id(self, action_id: str) -> Optional[DurableApprovalRecord]:
+    def load_approval_by_action_id(self, action_id: str) -> DurableApprovalRecord | None:
         app_id = self.approvals_by_action.get(action_id)
         return self.approvals.get(app_id) if app_id else None
 
     def save_mutation(self, record: DurableMutationRecord) -> None:
         self.mutations[record.action_id] = record
 
-    def load_mutation(self, action_id: str) -> Optional[DurableMutationRecord]:
+    def load_mutation(self, action_id: str) -> DurableMutationRecord | None:
         return self.mutations.get(action_id)
 
     def atomic_commit_mutation_and_approval(
@@ -114,10 +122,26 @@ class InMemoryWorkflowStore(CheckpointStorePort):
         self.save_mutation(mutation)
         self.save_approval(approval)
 
+    def commit_approval_transition(
+        self, previous: WorkflowState, updated: WorkflowState, approval: DurableApprovalRecord
+    ) -> None:
+        current = self.load_state(previous.workflow_id)
+        if (
+            current is None
+            or current.checkpoint_version != previous.checkpoint_version
+            or current.status != previous.status
+        ):
+            raise ConcurrentResumeConflictError("Approval checkpoint changed before commit.")
+        if approval.approval_id not in self.approvals:
+            raise ValueError("Pending approval not found.")
+        prepared = updated.with_updated_checksum()
+        self.approvals[approval.approval_id] = approval
+        self.checkpoints[updated.workflow_id] = prepared
+
     def append_audit_event(self, event: WorkflowAuditEvent) -> None:
         self.audit_events.append(event)
 
-    def load_audit_events(self, workflow_id: Optional[str] = None) -> List[WorkflowAuditEvent]:
+    def load_audit_events(self, workflow_id: str | None = None) -> list[WorkflowAuditEvent]:
         if workflow_id is None:
             return list(self.audit_events)
         return [e for e in self.audit_events if e.workflow_id == workflow_id]
@@ -131,12 +155,18 @@ class SQLiteWorkflowStore(CheckpointStorePort):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def _get_connection(self) -> Iterator[sqlite3.Connection]:
+        """Commit or roll back the transaction, then always release its handle."""
         conn = sqlite3.connect(str(self.db_path), timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA busy_timeout=5000;")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=5000;")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._get_connection() as conn:
@@ -206,7 +236,7 @@ class SQLiteWorkflowStore(CheckpointStorePort):
     async def load_checkpoint(
         self,
         workflow_id: str,
-    ) -> Optional[Mapping[str, Any]]:
+    ) -> Mapping[str, Any] | None:
         state = self.load_state(workflow_id)
         return state.to_dict() if state else None
 
@@ -245,7 +275,7 @@ class SQLiteWorkflowStore(CheckpointStorePort):
             )
             conn.commit()
 
-    def load_state(self, workflow_id: str) -> Optional[WorkflowState]:
+    def load_state(self, workflow_id: str) -> WorkflowState | None:
         with self._get_connection() as conn:
             cursor = conn.execute(
                 "SELECT state_json, checksum FROM workflow_checkpoints WHERE workflow_id = ?;",
@@ -270,6 +300,41 @@ class SQLiteWorkflowStore(CheckpointStorePort):
                     f"Integrity checksum mismatch for workflow '{workflow_id}'. File may be corrupted."
                 )
             return state
+
+    def commit_approval_transition(
+        self, previous: WorkflowState, updated: WorkflowState, approval: DurableApprovalRecord
+    ) -> None:
+        prepared = updated.with_updated_checksum()
+        with self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(
+                "UPDATE workflow_checkpoints SET status=?, current_step=?, checkpoint_version=?, state_json=?, checksum=?, updated_at=? WHERE workflow_id=? AND checkpoint_version=? AND status=?",
+                (
+                    prepared.status.value,
+                    prepared.current_step,
+                    prepared.checkpoint_version,
+                    json.dumps(prepared.to_dict()),
+                    prepared.checksum,
+                    prepared.updated_at,
+                    previous.workflow_id,
+                    previous.checkpoint_version,
+                    previous.status.value,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise ConcurrentResumeConflictError("Approval checkpoint changed before commit.")
+            changed = conn.execute(
+                "UPDATE workflow_approvals SET status=?, record_json=?, updated_at=? WHERE approval_id=? AND workflow_id=? AND status='pending'",
+                (
+                    approval.status.value,
+                    json.dumps(approval.to_dict()),
+                    time.time(),
+                    approval.approval_id,
+                    previous.workflow_id,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise ConcurrentResumeConflictError("Pending approval changed before commit.")
 
     def compare_and_swap_resume(
         self,
@@ -358,7 +423,7 @@ class SQLiteWorkflowStore(CheckpointStorePort):
             )
             conn.commit()
 
-    def load_approval(self, approval_id: str) -> Optional[DurableApprovalRecord]:
+    def load_approval(self, approval_id: str) -> DurableApprovalRecord | None:
         with self._get_connection() as conn:
             cursor = conn.execute(
                 "SELECT record_json FROM workflow_approvals WHERE approval_id = ?;",
@@ -369,7 +434,7 @@ class SQLiteWorkflowStore(CheckpointStorePort):
                 return None
             return DurableApprovalRecord.from_dict(json.loads(row["record_json"]))
 
-    def load_approval_by_action_id(self, action_id: str) -> Optional[DurableApprovalRecord]:
+    def load_approval_by_action_id(self, action_id: str) -> DurableApprovalRecord | None:
         with self._get_connection() as conn:
             cursor = conn.execute(
                 "SELECT record_json FROM workflow_approvals WHERE action_id = ?;",
@@ -409,7 +474,7 @@ class SQLiteWorkflowStore(CheckpointStorePort):
             )
             conn.commit()
 
-    def load_mutation(self, action_id: str) -> Optional[DurableMutationRecord]:
+    def load_mutation(self, action_id: str) -> DurableMutationRecord | None:
         with self._get_connection() as conn:
             cursor = conn.execute(
                 "SELECT record_json FROM workflow_mutation_ledger WHERE action_id = ?;",
@@ -502,7 +567,7 @@ class SQLiteWorkflowStore(CheckpointStorePort):
             )
             conn.commit()
 
-    def load_audit_events(self, workflow_id: Optional[str] = None) -> List[WorkflowAuditEvent]:
+    def load_audit_events(self, workflow_id: str | None = None) -> list[WorkflowAuditEvent]:
         with self._get_connection() as conn:
             if workflow_id:
                 cursor = conn.execute(
@@ -528,3 +593,54 @@ class SQLiteWorkflowStore(CheckpointStorePort):
                     )
                 )
             return results
+
+
+@contextmanager
+def execution_guard(store: Any, workflow_id: str) -> Iterator[None]:
+    """Local OS ownership survives coroutine waits and is released on process death."""
+    db_path = getattr(store, "db_path", None)
+    if db_path is None:
+        active: set[str] = getattr(store, "_active_executions", set())
+        store._active_executions = active
+        if workflow_id in active:
+            raise ConcurrentResumeConflictError("Workflow already has an active executor.")
+        active.add(workflow_id)
+        try:
+            yield
+        finally:
+            active.remove(workflow_id)
+        return
+    lock_dir = Path(db_path).parent / ".workflow-locks"
+    lock_dir.mkdir(exist_ok=True)
+    identity = hashlib.sha256(
+        (str(Path(db_path).resolve()) + ":" + workflow_id).encode()
+    ).hexdigest()
+    with (lock_dir / identity).open("a+b") as handle:
+        if os.fstat(handle.fileno()).st_size == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise ConcurrentResumeConflictError(
+                    "Workflow already has an active executor."
+                ) from exc
+        else:
+            fcntl = importlib.import_module("fcntl")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise ConcurrentResumeConflictError(
+                    "Workflow already has an active executor."
+                ) from exc
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

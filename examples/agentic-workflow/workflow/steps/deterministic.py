@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any
 
 from contracts.workflow import StepExecutionStatus
 
@@ -16,6 +16,13 @@ class IntakeValidationStep:
         self.customer_store = customer_store
 
     async def execute(self, state: WorkflowState) -> StepOutcome:
+        inquiry = state.domain_context.get("inquiry")
+        if not isinstance(inquiry, str) or not inquiry.strip():
+            return StepOutcome(
+                status=StepExecutionStatus.FAILED,
+                outcome_type="invalid_input",
+                error_message="Required field 'inquiry' must be a non-empty string.",
+            )
         customer_id = state.domain_context.get("customer_id")
         if not customer_id or not str(customer_id).strip():
             return StepOutcome(
@@ -76,7 +83,9 @@ class FinalizationStep:
     """Concludes workflow, emits audit summary, and transitions to terminal state."""
 
     async def execute(self, state: WorkflowState) -> StepOutcome:
-        resolution_summary = state.domain_context.get("resolution_summary", "Workflow completed successfully.")
+        resolution_summary = state.domain_context.get(
+            "resolution_summary", "Workflow completed successfully."
+        )
         return StepOutcome(
             status=StepExecutionStatus.SUCCEEDED,
             outcome_type="finalized",

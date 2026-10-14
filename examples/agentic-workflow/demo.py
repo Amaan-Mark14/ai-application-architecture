@@ -26,11 +26,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
+import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 BUILDING_BLOCKS_DIR = REPO_ROOT / "building-blocks" / "python"
@@ -53,13 +53,19 @@ from agent.executor import ToolExecutor
 from agent.policy import CustomerSupportAuthorizationPolicy
 from agent.registry import CapabilityRegistry
 from contracts.agent import AgentActor
-from contracts.workflow import ApprovalStatus, MutationStatus, WorkflowStatus
+from contracts.workflow import WorkflowStatus
+from workflow.business_store import SQLiteCustomerStore
 from workflow.engine import WorkflowEngine
 from workflow.remediation_workflow import build_customer_remediation_workflow
 from workflow.state import WorkflowActorSnapshot, WorkflowState
 from workflow.store import SQLiteWorkflowStore
 
 DEFAULT_DB_PATH = str(WORKFLOW_DIR / "workflow_demo.db")
+DEMO_ACTORS = {
+    "operator_bob": AgentActor("operator_bob", "senior_agent"),
+    "operator_junior": AgentActor("operator_junior", "junior_agent"),
+    "operator_admin": AgentActor("operator_admin", "admin"),
+}
 
 
 class DemoAgentEngine:
@@ -82,10 +88,15 @@ class DemoAgentEngine:
             answer = (
                 "Administrative record update requested.\n"
                 '{"proposal_type": "customer_note", "summary": "Record operational account note", '
-                f'"suggested_arguments": {{"note": "Customer inquiry noted: {self.inquiry}"}}, '
+                f'"suggested_arguments": {json.dumps({"note": "Customer inquiry noted: " + self.inquiry})}, '
                 '"requires_human_approval": false}'
             )
-        elif "credit" in inquiry_lower or "fee" in inquiry_lower or "dispute" in inquiry_lower or "refund" in inquiry_lower:
+        elif (
+            "credit" in inquiry_lower
+            or "fee" in inquiry_lower
+            or "dispute" in inquiry_lower
+            or "refund" in inquiry_lower
+        ):
             answer = (
                 "Verified billing discrepancy. Outage fee adjustment recommended.\n"
                 '{"proposal_type": "fee_credit", "summary": "Refund $25.00 dispute concession", '
@@ -103,7 +114,7 @@ class DemoAgentEngine:
             def __init__(self, text: str) -> None:
                 self.final_answer = text
                 self.status = "COMPLETED"
-                self.execution_receipts = []
+                self.execution_receipts: list[Any] = []
                 self.run_id = f"demo-run-{time.time_ns()}"
                 self.step_count = 2
 
@@ -111,9 +122,9 @@ class DemoAgentEngine:
 
 
 def get_components(db_path: str, inquiry: str = "") -> tuple[WorkflowEngine, InMemoryCustomerStore]:
-    customer_store = InMemoryCustomerStore()
-    auth_policy = CustomerSupportAuthorizationPolicy(store=customer_store)
     sqlite_store = SQLiteWorkflowStore(db_path)
+    customer_store = SQLiteCustomerStore(sqlite_store)
+    auth_policy = CustomerSupportAuthorizationPolicy(store=customer_store)
 
     read_only_caps = [
         GetCustomerCapability(customer_store),
@@ -134,6 +145,7 @@ def get_components(db_path: str, inquiry: str = "") -> tuple[WorkflowEngine, InM
         tool_executor=executor,
         workflow_store=sqlite_store,
         auth_policy=auth_policy,
+        actor_resolver=DEMO_ACTORS.get,
     )
 
     engine = WorkflowEngine(definition=workflow_def, store=sqlite_store)
@@ -162,10 +174,12 @@ async def cmd_start(args: argparse.Namespace) -> int:
     db_path = args.db or DEFAULT_DB_PATH
     customer_id = args.customer
     inquiry = args.inquiry
-    role = args.role
-
+    current_actor = DEMO_ACTORS.get(args.actor)
+    if current_actor is None or (args.role is not None and args.role != current_actor.role):
+        print("Actor or role does not match the host's local demo actor directory.")
+        return 1
     engine, _ = get_components(db_path, inquiry)
-    actor = WorkflowActorSnapshot(actor_id=args.actor, role=role)
+    actor = WorkflowActorSnapshot(actor_id=current_actor.actor_id, role=current_actor.role)
 
     print(f"\n[DEMO START] Initializing workflow '{wf_id}' against '{db_path}'...")
     print(f"Customer ID:  {customer_id}")
@@ -190,7 +204,7 @@ async def cmd_start(args: argparse.Namespace) -> int:
         print(f"  Target Capability:   {state.domain_context.get('target_capability')}")
         print(f"  Proposed Arguments:  {args_dict}")
         print("\nProcess is now cleanly terminating. State is safely persisted in SQLite.")
-        print(f"To inspect or resume in another terminal:")
+        print("To inspect or resume in another terminal:")
         print(f"  python3 demo.py status --workflow-id {wf_id}")
         print(f"  python3 demo.py approve --workflow-id {wf_id} --approver manager_jane")
     else:
@@ -256,7 +270,7 @@ async def cmd_decision(args: argparse.Namespace, decision: str) -> int:
     approver = args.approver
     reason = args.reason or f"CLI {decision.upper()} action"
 
-    engine, customer_store = get_components(db_path)
+    engine, _customer_store = get_components(db_path)
 
     print(f"\n[DEMO RESUME] Resuming workflow '{wf_id}' from '{db_path}'...")
     print(f"Decision: {decision.upper()}")
@@ -281,27 +295,48 @@ async def cmd_decision(args: argparse.Namespace, decision: str) -> int:
                 print(f"Physical Execution Receipt: {mutation.execution_receipt.result_summary}")
 
         return 0
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- finalize failures from external execution boundaries.
         print(f"\nExecution halted with error: {exc}")
         return 1
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phase 7 Agentic Workflow Orchestration CLI Demo")
-    parser.add_argument("--db", "--db-path", dest="db", type=str, default=DEFAULT_DB_PATH, help="Path to SQLite database file")
+    parser.add_argument(
+        "--db",
+        "--db-path",
+        dest="db",
+        type=str,
+        default=DEFAULT_DB_PATH,
+        help="Path to SQLite database file",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # start subcommand
     p_start = subparsers.add_parser("start", help="Start new remediation workflow instance")
     p_start.add_argument("--workflow-id", type=str, default=None, help="Custom workflow identifier")
-    p_start.add_argument("--customer", type=str, default="cust-001", help="Customer ID (cust-001, cust-002, etc.)")
-    p_start.add_argument("--inquiry", type=str, default="Dispute accidental $25 overdraft fee during platform outage", help="Customer inquiry description")
+    p_start.add_argument(
+        "--customer", type=str, default="cust-001", help="Customer ID (cust-001, cust-002, etc.)"
+    )
+    p_start.add_argument(
+        "--inquiry",
+        type=str,
+        default="Dispute accidental $25 overdraft fee during platform outage",
+        help="Customer inquiry description",
+    )
     p_start.add_argument("--actor", type=str, default="operator_bob", help="Initiating actor ID")
-    p_start.add_argument("--role", type=str, default="senior_agent", help="Initiating actor role (junior_agent, senior_agent, admin)")
+    p_start.add_argument(
+        "--role",
+        type=str,
+        default=None,
+        help="Optional role assertion; must match the local actor directory",
+    )
 
     # status subcommand
-    p_status = subparsers.add_parser("status", help="Inspect status and durable records of a workflow")
+    p_status = subparsers.add_parser(
+        "status", help="Inspect status and durable records of a workflow"
+    )
     p_status.add_argument("--workflow-id", type=str, required=True, help="Workflow ID to inspect")
 
     # approve subcommand
@@ -316,6 +351,9 @@ def main() -> None:
     p_rej.add_argument("--approver", type=str, default="manager_jane", help="Approver ID")
     p_rej.add_argument("--reason", type=str, default=None, help="Rejection justification")
 
+    p_recover = subparsers.add_parser("recover", help="Recover an abandoned RUNNING workflow")
+    p_recover.add_argument("--workflow-id", type=str, required=True)
+
     args = parser.parse_args()
 
     if args.command == "start":
@@ -326,6 +364,10 @@ def main() -> None:
         sys.exit(asyncio.run(cmd_decision(args, "approved")))
     elif args.command == "reject":
         sys.exit(asyncio.run(cmd_decision(args, "rejected")))
+    elif args.command == "recover":
+        engine, _ = get_components(args.db or DEFAULT_DB_PATH)
+        recovered = asyncio.run(engine.recover_workflow(args.workflow_id))
+        print(format_state_banner(recovered))
 
 
 if __name__ == "__main__":

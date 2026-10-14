@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional
+from typing import Any
 
 from contracts.agent import (
     AgentActor,
@@ -13,7 +14,7 @@ from contracts.agent import (
     ApprovalPort,
     CapabilityMetadata,
 )
-from contracts.workflow import ApprovalStatus
+from contracts.workflow import ApprovalStatus, WorkflowDefinitionRef
 
 from .errors import (
     ApprovalMismatchError,
@@ -25,6 +26,19 @@ from .errors import (
 def canonicalize_arguments(arguments: Mapping[str, Any]) -> str:
     """Produce deterministic JSON representation with sorted keys and normalized separators."""
     return json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def resolve_current_actor(
+    actor_id: str,
+    resolver: Callable[[str], AgentActor | None] | None,
+) -> AgentActor:
+    """Resolve privileges through host-owned identity data, never a saved snapshot."""
+    if resolver is None:
+        raise PermissionError("No trusted current-actor lookup configured.")
+    actor = resolver(actor_id)
+    if not isinstance(actor, AgentActor) or actor.actor_id != actor_id:
+        raise PermissionError(f"Current actor '{actor_id}' is unavailable or mismatched.")
+    return actor
 
 
 @dataclass(frozen=True)
@@ -41,20 +55,20 @@ class DurableApprovalRecord:
     actor_id: str
     actor_role: str
     status: ApprovalStatus = ApprovalStatus.PENDING
-    approver_id: Optional[str] = None
-    approver_role: Optional[str] = None
-    reason: Optional[str] = None
+    approver_id: str | None = None
+    approver_role: str | None = None
+    reason: str | None = None
     requested_at: float = field(default_factory=time.time)
-    decided_at: Optional[float] = None
-    consumed_at: Optional[float] = None
-    execution_receipt_id: Optional[str] = None
-    expires_at: Optional[float] = None
+    decided_at: float | None = None
+    consumed_at: float | None = None
+    execution_receipt_id: str | None = None
+    expires_at: float | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.status, str):
             object.__setattr__(self, "status", ApprovalStatus(self.status))
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "approval_id": self.approval_id,
             "workflow_id": self.workflow_id,
@@ -101,7 +115,7 @@ class DurableApprovalRecord:
 
 
 class WorkflowApprovalVerifier:
-    """Pre-execution approval verification ensuring all 7 security bindings match."""
+    """Pre-execution verification of lifecycle, definition and execution bindings."""
 
     @staticmethod
     def verify(
@@ -111,6 +125,7 @@ class WorkflowApprovalVerifier:
         capability: CapabilityMetadata,
         arguments: Mapping[str, Any],
         actor: AgentActor,
+        expected_definition: WorkflowDefinitionRef,
     ) -> None:
         """Verify that a durable approval record authorizes the intended capability execution."""
         # 1. Check approval lifecycle status
@@ -127,6 +142,14 @@ class WorkflowApprovalVerifier:
         if record.workflow_id != expected_workflow_id:
             raise ApprovalMismatchError(
                 f"Approval workflow mismatch: record is for '{record.workflow_id}', expected '{expected_workflow_id}'."
+            )
+
+        if (
+            record.workflow_definition_id != expected_definition.definition_id
+            or record.workflow_definition_version != expected_definition.version
+        ):
+            raise ApprovalMismatchError(
+                "Approval workflow definition identity or version mismatch."
             )
 
         # 3. Check action ID binding
@@ -171,10 +194,12 @@ class WorkflowApprovalAdapter(ApprovalPort):
         approval_record: DurableApprovalRecord,
         expected_workflow_id: str,
         expected_action_id: str,
+        expected_definition: WorkflowDefinitionRef,
     ) -> None:
         self.approval_record = approval_record
         self.expected_workflow_id = expected_workflow_id
         self.expected_action_id = expected_action_id
+        self.expected_definition = expected_definition
 
     async def request_approval(
         self,
@@ -191,15 +216,16 @@ class WorkflowApprovalAdapter(ApprovalPort):
                 capability=capability,
                 arguments=arguments,
                 actor=actor,
+                expected_definition=self.expected_definition,
             )
             return ApprovalDecision(
                 approved=True,
                 approver=self.approval_record.approver_id or "workflow_durable_approver",
                 reason=self.approval_record.reason or "Durable workflow approval verified.",
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- finalize failures from external execution boundaries.
             return ApprovalDecision(
                 approved=False,
                 approver="workflow_approval_verifier",
-                reason=f"Approval verification rejected: {str(exc)}",
+                reason=f"Approval verification rejected: {exc!s}",
             )

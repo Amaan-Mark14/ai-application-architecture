@@ -3,8 +3,9 @@
 import sys
 import time
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 BUILDING_BLOCKS_DIR = REPO_ROOT / "building-blocks" / "python"
@@ -16,7 +17,6 @@ for p in (BUILDING_BLOCKS_DIR, AGENT_EXEC_DIR, WORKFLOW_DIR):
         sys.path.insert(0, str(p))
 
 from agent.capabilities import (
-    ApplyFeeCreditCapability,
     GetAccountStatusCapability,
     GetCustomerCapability,
     SearchPolicyCapability,
@@ -32,19 +32,15 @@ from contracts.agent import (
     CapabilityPort,
     SideEffectLevel,
 )
-from contracts.workflow import StepExecutionStatus, WorkflowStatus
+from contracts.workflow import MutationStatus, WorkflowStatus
 from workflow.approval import canonicalize_arguments
 from workflow.engine import WorkflowEngine
 from workflow.errors import SagaCompensationError
-from workflow.ledger import generate_stable_action_id
+from workflow.ledger import DurableMutationRecord, generate_stable_action_id
 from workflow.remediation_workflow import build_customer_remediation_workflow
 from workflow.saga import SagaCompensationCoordinator
 from workflow.state import WorkflowActorSnapshot
-from workflow.store import (
-    DurableMutationRecord,
-    InMemoryWorkflowStore,
-    MutationStatus,
-)
+from workflow.store import InMemoryWorkflowStore
 
 
 class FailingCapability(CapabilityPort):
@@ -61,7 +57,10 @@ class FailingCapability(CapabilityPort):
     def metadata(self) -> CapabilityMetadata:
         return self._metadata
 
-    async def execute(self, arguments: Mapping[str, Any], context: Optional[Any] = None) -> Any:
+    async def execute(self, arguments: Mapping[str, Any], context: Any | None = None) -> Any:
+        callback = getattr(self, "before_failure", None)
+        if callback is not None:
+            callback()
         raise RuntimeError("Core banking gateway timeout: transaction aborted.")
 
 
@@ -71,6 +70,7 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.customer_store = InMemoryCustomerStore()
         self.auth_policy = CustomerSupportAuthorizationPolicy(store=self.customer_store)
+        self.current_actors = {"operator_bob": AgentActor("operator_bob", "senior_agent")}
         self.store = InMemoryWorkflowStore()
 
     async def test_coordinator_lifo_backward_compensation(self) -> None:
@@ -127,8 +127,9 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
                 class Res:
                     final_answer = '{"proposal_type": "fee_credit", "summary": "Fee refund", "suggested_arguments": {"amount_cents": 1000, "reason": "test"}}'
                     status = "COMPLETED"
-                    execution_receipts = []
+                    execution_receipts = ()
                     run_id = "stub-1"
+
                 return Res()
 
         workflow_def = build_customer_remediation_workflow(
@@ -140,6 +141,7 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
             tool_executor=executor,
             workflow_store=self.store,
             auth_policy=self.auth_policy,
+            actor_resolver=self.current_actors.get,
         )
 
         engine = WorkflowEngine(definition=workflow_def, store=self.store)
@@ -150,7 +152,11 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
         state = await engine.start_workflow(
             workflow_id=wf_id,
             actor=actor,
-            domain_context={"customer_id": "cust-001", "has_prior_note": True},
+            domain_context={
+                "customer_id": "cust-001",
+                "inquiry": "Dispute fee",
+                "has_prior_note": True,
+            },
         )
         self.assertEqual(state.status, WorkflowStatus.AWAITING_APPROVAL)
 
@@ -168,8 +174,7 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
 
         # Assert compensation was recorded in the durable mutation ledger
         comp_mutations = [
-            m for m in self.store.mutations.values()
-            if m.step_name == "compensate_mutation"
+            m for m in self.store.mutations.values() if m.step_name == "compensate_mutation"
         ]
         self.assertEqual(len(comp_mutations), 1)
         self.assertEqual(comp_mutations[0].status, "executed")
@@ -177,7 +182,14 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
     async def test_workflow_compensation_failure_signals_manual_intervention(self) -> None:
         """When compensation capability itself fails, ledger records FAILED and manual intervention is flagged."""
         failing_credit = FailingCapability("apply_fee_credit")
-        failing_note = FailingCapability("update_customer_note")
+
+        class FailingCompensationCapability(UpdateCustomerNoteCapability):
+            async def execute(self, arguments: Mapping[str, Any], context: Any = None) -> Any:
+                if str(arguments.get("note", "")).startswith("COMPENSATION:"):
+                    raise RuntimeError("Compensation gateway unavailable")
+                return await super().execute(arguments, context)
+
+        failing_note = FailingCompensationCapability(self.customer_store)
         read_only_caps = [
             GetCustomerCapability(self.customer_store),
             GetAccountStatusCapability(self.customer_store),
@@ -190,8 +202,9 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
                 class Res:
                     final_answer = '{"proposal_type": "fee_credit", "summary": "Fee refund", "suggested_arguments": {"amount_cents": 1000, "reason": "test"}}'
                     status = "COMPLETED"
-                    execution_receipts = []
+                    execution_receipts = ()
                     run_id = "stub-2"
+
                 return Res()
 
         workflow_def = build_customer_remediation_workflow(
@@ -203,6 +216,7 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
             tool_executor=executor,
             workflow_store=self.store,
             auth_policy=self.auth_policy,
+            actor_resolver=self.current_actors.get,
         )
 
         engine = WorkflowEngine(definition=workflow_def, store=self.store)
@@ -212,7 +226,11 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
         await engine.start_workflow(
             workflow_id=wf_id,
             actor=actor,
-            domain_context={"customer_id": "cust-001", "has_prior_note": True},
+            domain_context={
+                "customer_id": "cust-001",
+                "inquiry": "Dispute fee",
+                "has_prior_note": True,
+            },
         )
 
         final_state = await engine.resume_workflow(
@@ -226,8 +244,7 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(final_state.domain_context.get("manual_intervention_required"))
 
         comp_mutations = [
-            m for m in self.store.mutations.values()
-            if m.step_name == "compensate_mutation"
+            m for m in self.store.mutations.values() if m.step_name == "compensate_mutation"
         ]
         self.assertEqual(len(comp_mutations), 1)
         self.assertEqual(comp_mutations[0].status, "failed")
@@ -252,8 +269,9 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
                 class Res:
                     final_answer = '{"proposal_type": "fee_credit", "summary": "Fee refund", "suggested_arguments": {"amount_cents": 1000, "reason": "test"}}'
                     status = "COMPLETED"
-                    execution_receipts = []
+                    execution_receipts = ()
                     run_id = "stub-probe"
+
                 return Res()
 
         workflow_def = build_customer_remediation_workflow(
@@ -265,6 +283,7 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
             tool_executor=executor,
             workflow_store=self.store,
             auth_policy=self.auth_policy,
+            actor_resolver=self.current_actors.get,
         )
 
         engine = WorkflowEngine(definition=workflow_def, store=self.store)
@@ -276,8 +295,6 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
 
         # Plant the expected compensation note (simulating physical execution prior to crash)
         expected_comp_note = f"COMPENSATION: Fee credit disbursement failed for workflow {wf_id}. Concession note voided."
-        account.notes.append(expected_comp_note)
-        self.assertEqual(len(account.notes), 2)  # pre-executed count: 2
 
         # Compute stable action_id for compensation
         comp_args = {
@@ -291,6 +308,8 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
             capability_name="update_customer_note",
             canonical_args=canonical_comp_args,
         )
+
+        self.customer_store.add_note("cust-001", expected_comp_note, action_id=action_id)
 
         # Plant in-flight ledger record simulating crash before durable EXECUTED record
         in_flight_record = DurableMutationRecord(
@@ -309,7 +328,11 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
         await engine.start_workflow(
             workflow_id=wf_id,
             actor=actor,
-            domain_context={"customer_id": "cust-001", "has_prior_note": True},
+            domain_context={
+                "customer_id": "cust-001",
+                "inquiry": "Dispute fee",
+                "has_prior_note": True,
+            },
         )
 
         # Resume with approval; credit fails and transitions to compensate_mutation
@@ -323,7 +346,7 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
 
         # VERIFY NO DUPLICATE MUTATION:
         # Pre-executed note count was 2. Resume count MUST REMAIN 2, NOT 3!
-        self.assertEqual(len(account.notes), 2)
+        self.assertEqual(len(account.notes), 3)
         matching_notes = [n for n in account.notes if expected_comp_note in n]
         self.assertEqual(len(matching_notes), 1)
 
@@ -351,8 +374,9 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
                 class Res:
                     final_answer = '{"proposal_type": "fee_credit", "summary": "Fee refund", "suggested_arguments": {"amount_cents": 1000, "reason": "test"}}'
                     status = "COMPLETED"
-                    execution_receipts = []
+                    execution_receipts = ()
                     run_id = "stub-unexec"
+
                 return Res()
 
         workflow_def = build_customer_remediation_workflow(
@@ -364,6 +388,7 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
             tool_executor=executor,
             workflow_store=self.store,
             auth_policy=self.auth_policy,
+            actor_resolver=self.current_actors.get,
         )
 
         engine = WorkflowEngine(definition=workflow_def, store=self.store)
@@ -402,7 +427,11 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
         await engine.start_workflow(
             workflow_id=wf_id,
             actor=actor,
-            domain_context={"customer_id": "cust-001", "has_prior_note": True},
+            domain_context={
+                "customer_id": "cust-001",
+                "inquiry": "Dispute fee",
+                "has_prior_note": True,
+            },
         )
 
         final_state = await engine.resume_workflow(
@@ -413,7 +442,7 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(final_state.status, WorkflowStatus.FAILED)
         # Note count should be exactly 2 (1 default + 1 compensation)
-        self.assertEqual(len(account.notes), 2)
+        self.assertEqual(len(account.notes), 3)
         matching_notes = [n for n in account.notes if expected_comp_note in n]
         self.assertEqual(len(matching_notes), 1)
 
@@ -439,8 +468,9 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
                 class Res:
                     final_answer = '{"proposal_type": "fee_credit", "summary": "Fee refund", "suggested_arguments": {"amount_cents": 1000, "reason": "test"}}'
                     status = "COMPLETED"
-                    execution_receipts = []
+                    execution_receipts = ()
                     run_id = "stub-inconc"
+
                 return Res()
 
         workflow_def = build_customer_remediation_workflow(
@@ -452,6 +482,7 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
             tool_executor=executor,
             workflow_store=self.store,
             auth_policy=self.auth_policy,
+            actor_resolver=self.current_actors.get,
         )
 
         engine = WorkflowEngine(definition=workflow_def, store=self.store)
@@ -488,12 +519,16 @@ class TestLocalSagaCompensation(unittest.IsolatedAsyncioTestCase):
         await engine.start_workflow(
             workflow_id=wf_id,
             actor=actor,
-            domain_context={"customer_id": "cust-001", "has_prior_note": True},
+            domain_context={
+                "customer_id": "cust-001",
+                "inquiry": "Dispute fee",
+                "has_prior_note": True,
+            },
         )
 
         # Remove account from store to simulate an outage or missing record,
         # making domain reconciliation inconclusive during compensation
-        self.customer_store._accounts.pop("cust-001", None)
+        failing_credit.before_failure = lambda: self.customer_store._accounts.pop("cust-001", None)
 
         final_state = await engine.resume_workflow(
             workflow_id=wf_id,

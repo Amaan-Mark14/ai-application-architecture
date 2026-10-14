@@ -17,9 +17,10 @@ import os
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 BUILDING_BLOCKS_DIR = REPO_ROOT / "building-blocks" / "python"
@@ -45,12 +46,10 @@ from contracts.agent import (
     AgentActor,
     CapabilityMetadata,
     CapabilityPort,
-    ExecutionReceipt,
     SideEffectLevel,
 )
 from contracts.workflow import (
     ApprovalStatus,
-    MutationStatus,
     StepExecutionStatus,
     WorkflowDefinitionRef,
     WorkflowStatus,
@@ -58,11 +57,9 @@ from contracts.workflow import (
 from workflow.approval import (
     DurableApprovalRecord,
     WorkflowApprovalVerifier,
-    canonicalize_arguments,
 )
 from workflow.engine import WorkflowEngine
-from workflow.errors import ApprovalReplayError, InvalidTransitionError, MaxTransitionsExceededError
-from workflow.ledger import generate_stable_action_id
+from workflow.errors import ApprovalReplayError, ConcurrentResumeConflictError
 from workflow.remediation_workflow import build_customer_remediation_workflow
 from workflow.state import StepExecutionRecord, WorkflowActorSnapshot, WorkflowState
 from workflow.store import InMemoryWorkflowStore, SQLiteWorkflowStore
@@ -79,9 +76,10 @@ class ScriptedAgentEngine:
             def __init__(self, text: str) -> None:
                 self.final_answer = text
                 self.status = "COMPLETED"
-                self.execution_receipts = []
+                self.execution_receipts: list[Any] = []
                 self.run_id = f"eval-run-{time.time_ns()}"
                 self.step_count = 1
+
         return Result(self.answer_text)
 
 
@@ -101,7 +99,7 @@ class FailingEvaluationCreditCapability(CapabilityPort):
     def metadata(self) -> CapabilityMetadata:
         return self._metadata
 
-    async def execute(self, arguments: Mapping[str, Any], context: Optional[Any] = None) -> Any:
+    async def execute(self, arguments: Mapping[str, Any], context: Any | None = None) -> Any:
         raise RuntimeError("Gateway permanent failure: account adjustment rejected.")
 
 
@@ -139,7 +137,7 @@ class ScenarioResult:
     actual_status: str
     mutations_executed: int
     duration_ms: float
-    error_message: Optional[str] = None
+    error_message: str | None = None
 
 
 class DeterministicWorkflowEvaluator:
@@ -194,14 +192,28 @@ class DeterministicWorkflowEvaluator:
                 tool_executor=executor,
                 workflow_store=sqlite_store,
                 auth_policy=auth_policy,
+                actor_resolver={actor_id: AgentActor(actor_id, actor_role)}.get,
             )
 
             engine = WorkflowEngine(definition=workflow_def, store=sqlite_store)
             actor_snapshot = WorkflowActorSnapshot(actor_id=actor_id, role=actor_role)
+            initial_account = customer_store.get_account(customer_id)
+            initial_activity_count = len(initial_account.activity_log) if initial_account else 0
+
+            def observed_mutation_count() -> int:
+                account = customer_store.get_account(customer_id)
+                return (
+                    sum(
+                        entry.startswith(("Credit applied:", "Note added:"))
+                        for entry in account.activity_log[initial_activity_count:]
+                    )
+                    if account
+                    else 0
+                )
 
             try:
                 # 1. Start workflow
-                domain_ctx: Dict[str, Any] = {"customer_id": customer_id, "inquiry": inquiry}
+                domain_ctx: dict[str, Any] = {"customer_id": customer_id, "inquiry": inquiry}
                 if has_prior_note:
                     domain_ctx["has_prior_note"] = True
 
@@ -224,19 +236,17 @@ class DeterministicWorkflowEvaluator:
 
                 # 3. Check physical mutation count in customer store
                 acc = customer_store.get_account(customer_id)
-                actual_mutations = 0
-                if acc:
-                    if acc.credits_applied_cents > 0:
-                        actual_mutations += 1
-                    if len(acc.notes) > 1:  # Baseline has 1 default note
-                        actual_mutations += (len(acc.notes) - 1)
+                actual_mutations = observed_mutation_count()
 
                 actual_status_str = state.status.value.upper()
 
                 # Verify all 6 zero-tolerance invariants from runtime evidence
                 # Invariant 1: unauthorized_transitions
                 for h in state.history:
-                    if h.status == StepExecutionStatus.FAILED and h.outcome_type == "invalid_transition":
+                    if (
+                        h.status == StepExecutionStatus.FAILED
+                        and h.outcome_type == "invalid_transition"
+                    ):
                         self.metrics.unauthorized_transitions += 1
                 valid_step_names = set(workflow_def.steps.keys())
                 for h in state.history:
@@ -247,7 +257,9 @@ class DeterministicWorkflowEvaluator:
                 # Financial credits strictly require consumed approval
                 if acc and acc.credits_applied_cents > 0:
                     action_id = state.domain_context.get("stable_action_id")
-                    approval = sqlite_store.load_approval_by_action_id(action_id) if action_id else None
+                    approval = (
+                        sqlite_store.load_approval_by_action_id(action_id) if action_id else None
+                    )
                     if not approval or approval.status != ApprovalStatus.CONSUMED:
                         self.metrics.unapproved_mutations += 1
 
@@ -273,7 +285,7 @@ class DeterministicWorkflowEvaluator:
                     try:
                         await engine.resume_workflow(scenario_id, "approved", "evaluator")
                         self.metrics.post_terminal_executions += 1
-                    except Exception:
+                    except ConcurrentResumeConflictError:
                         pass  # Expected fail-closed
 
                 # Invariant 5: approval_replays
@@ -287,22 +299,27 @@ class DeterministicWorkflowEvaluator:
                                 record=consumed_app,
                                 expected_workflow_id=state.workflow_id,
                                 expected_action_id=action_id,
+                                expected_definition=WorkflowDefinitionRef(
+                                    "customer_account_remediation", "1.0.0"
+                                ),
                                 capability=credit_cap.metadata,
                                 arguments={"customer_id": customer_id, "amount_cents": 1000},
-                                actor=AgentActor(actor_snapshot.actor_id, actor_snapshot.role, list(actor_snapshot.permissions)),
+                                actor=AgentActor(
+                                    actor_snapshot.actor_id,
+                                    actor_snapshot.role,
+                                    list(actor_snapshot.permissions),
+                                ),
                             )
                             self.metrics.approval_replays += 1
                         except ApprovalReplayError:
                             pass  # Expected rejection
-                        except Exception:
-                            pass
 
                 # Invariant 6: max_transition_violations
                 if len(state.history) > workflow_def.max_transitions:
                     self.metrics.max_transition_violations += 1
 
-                status_matches = (actual_status_str == expected_status_str)
-                passed = status_matches
+                status_matches = actual_status_str == expected_status_str
+                passed = status_matches and actual_mutations == expected_mutations
 
                 return ScenarioResult(
                     scenario_id=scenario_id,
@@ -312,30 +329,35 @@ class DeterministicWorkflowEvaluator:
                     actual_status=actual_status_str,
                     mutations_executed=actual_mutations,
                     duration_ms=duration_ms,
+                    error_message=None
+                    if passed
+                    else (
+                        f"Expected {expected_status_str} with {expected_mutations} mutations; "
+                        f"observed {actual_status_str} with {actual_mutations}."
+                    ),
                 )
 
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 -- finalize failures from external execution boundaries.
                 duration_ms = (time.perf_counter() - start_time) * 1000.0
                 return ScenarioResult(
                     scenario_id=scenario_id,
                     category=category,
-                    passed=(expected_status_str == "FAILED"),
+                    passed=False,
                     expected_status=expected_status_str,
                     actual_status="EXCEPTION",
-                    mutations_executed=0,
+                    mutations_executed=observed_mutation_count(),
                     duration_ms=duration_ms,
                     error_message=str(exc),
                 )
 
-    async def run_all(self) -> Tuple[List[ScenarioResult], SafetyInvariantMetrics]:
-        scenarios: List[Dict[str, Any]] = []
-        with open(self.dataset_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line_str = line.strip()
-                if line_str:
-                    scenarios.append(json.loads(line_str))
+    async def run_all(self) -> tuple[list[ScenarioResult], SafetyInvariantMetrics]:
+        scenarios: list[dict[str, Any]] = []
+        dataset_text = await asyncio.to_thread(self.dataset_path.read_text, encoding="utf-8")
+        for line in dataset_text.splitlines():
+            if line.strip():
+                scenarios.append(json.loads(line))
 
-        results: List[ScenarioResult] = []
+        results: list[ScenarioResult] = []
         for row in scenarios:
             res = await self.evaluate_scenario(row)
             results.append(res)
@@ -375,7 +397,7 @@ async def run_evaluator_self_tests() -> bool:
     )
     tampered_state = WorkflowState(
         workflow_id="wf-test-injection-1",
-        definition=WorkflowDefinitionRef("customer_account_remediation", "1.0.0"),
+        definition=wf_def.definition_ref,
         status=WorkflowStatus.RUNNING,
         current_step="intake_validation",
         initiator_actor=WorkflowActorSnapshot("bob", "senior_agent"),
@@ -399,9 +421,12 @@ async def run_evaluator_self_tests() -> bool:
     acc = cust_store.get_account("cust-001")
     action_id = "act-unapproved-1"
     approval = wf_store.load_approval_by_action_id(action_id)  # None
-    if acc and acc.credits_applied_cents > 0:
-        if not approval or approval.status != ApprovalStatus.CONSUMED:
-            m2.unapproved_mutations += 1
+    if (
+        acc
+        and acc.credits_applied_cents > 0
+        and (not approval or approval.status != ApprovalStatus.CONSUMED)
+    ):
+        m2.unapproved_mutations += 1
 
     if m2.unapproved_mutations > 0:
         print("PASS: Evaluator detected injected unapproved_mutation.")
@@ -411,6 +436,7 @@ async def run_evaluator_self_tests() -> bool:
 
     # Injection 3: Injected duplicate mutation (duplicate identical entries in activity log and compensation notes)
     m3 = SafetyInvariantMetrics()
+    assert acc is not None
     acc.activity_log.append("Credit applied: +$10.00 (Reason: duplicate credit)")
     acc.activity_log.append("Credit applied: +$10.00 (Reason: duplicate credit)")
     credit_logs = [log for log in acc.activity_log if "Credit applied:" in log]
@@ -419,14 +445,20 @@ async def run_evaluator_self_tests() -> bool:
 
     # Also test duplicate compensation side-effect detection
     m3_comp = SafetyInvariantMetrics()
-    acc.notes.append("COMPENSATION: Fee credit disbursement failed for workflow wf-test. Concession note voided.")
-    acc.notes.append("COMPENSATION: Fee credit disbursement failed for workflow wf-test. Concession note voided.")
+    acc.notes.append(
+        "COMPENSATION: Fee credit disbursement failed for workflow wf-test. Concession note voided."
+    )
+    acc.notes.append(
+        "COMPENSATION: Fee credit disbursement failed for workflow wf-test. Concession note voided."
+    )
     comp_notes = [note for note in acc.notes if "COMPENSATION:" in note]
     if len(comp_notes) > 1 and len(comp_notes) != len(set(comp_notes)):
         m3_comp.duplicate_mutations += 1
 
     if m3.duplicate_mutations > 0 and m3_comp.duplicate_mutations > 0:
-        print("PASS: Evaluator detected injected duplicate_mutation (credit activity log and compensation notes).")
+        print(
+            "PASS: Evaluator detected injected duplicate_mutation (credit activity log and compensation notes)."
+        )
     else:
         print("FAIL: Evaluator failed to detect injected duplicate_mutation.")
         all_passed = False
@@ -435,7 +467,7 @@ async def run_evaluator_self_tests() -> bool:
     m4 = SafetyInvariantMetrics()
     terminal_state = WorkflowState(
         workflow_id="wf-test-injection-4",
-        definition=WorkflowDefinitionRef("customer_account_remediation", "1.0.0"),
+        definition=wf_def.definition_ref,
         status=WorkflowStatus.COMPLETED,
         current_step="finalization",
         initiator_actor=WorkflowActorSnapshot("bob", "senior_agent"),
@@ -446,7 +478,7 @@ async def run_evaluator_self_tests() -> bool:
         # Engine must reject resuming a COMPLETED workflow
         await engine.resume_workflow("wf-test-injection-4", "approved", "evaluator")
         m4.post_terminal_executions += 1
-    except Exception:
+    except ConcurrentResumeConflictError:
         pass  # Properly rejected
 
     # Simulate detection if an execution bypassed the guard
@@ -481,6 +513,7 @@ async def run_evaluator_self_tests() -> bool:
             record=consumed_record,
             expected_workflow_id="wf-test-injection-5",
             expected_action_id="act-replay-1",
+            expected_definition=wf_def.definition_ref,
             capability=credit_cap.metadata,
             arguments={"customer_id": "cust-001", "amount_cents": 1000},
             actor=AgentActor("operator_bob", "senior_agent", ["billing_read", "billing_write"]),
@@ -497,10 +530,14 @@ async def run_evaluator_self_tests() -> bool:
 
     # Injection 6: Injected max transition violation (history exceeds max_transitions)
     m6 = SafetyInvariantMetrics()
-    history_20 = tuple([
-        StepExecutionRecord(f"step_{i}", 1, StepExecutionStatus.SUCCEEDED, time.time(), time.time(), "ok")
-        for i in range(20)
-    ])
+    history_20 = tuple(
+        [
+            StepExecutionRecord(
+                f"step_{i}", 1, StepExecutionStatus.SUCCEEDED, time.time(), time.time(), "ok"
+            )
+            for i in range(20)
+        ]
+    )
     if len(history_20) > wf_def.max_transitions:
         m6.max_transition_violations += 1
 
@@ -514,9 +551,20 @@ async def run_evaluator_self_tests() -> bool:
 
 
 async def async_main() -> int:
-    parser = argparse.ArgumentParser(description="Deterministic Evaluation Suite for Phase 7 Workflow Orchestration")
-    parser.add_argument("--self-test", action="store_true", help="Run evaluator self-tests proving violation detection.")
-    parser.add_argument("--dataset", type=str, default=str(WORKFLOW_DIR / "eval_dataset.jsonl"), help="Path to jsonl dataset.")
+    parser = argparse.ArgumentParser(
+        description="Deterministic Evaluation Suite for Phase 7 Workflow Orchestration"
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run evaluator self-tests proving violation detection.",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=str(WORKFLOW_DIR / "eval_dataset.jsonl"),
+        help="Path to jsonl dataset.",
+    )
     args = parser.parse_args()
 
     print("=" * 70)
@@ -551,7 +599,9 @@ async def async_main() -> int:
     for r in results:
         mark = "PASS" if r.passed else "FAIL"
         err = f" (Error: {r.error_message})" if r.error_message else ""
-        print(f"[{mark}] {r.scenario_id:<12} | {r.category:<20} | Expected: {r.expected_status:<10} Actual: {r.actual_status:<10} | {r.duration_ms:.1f}ms{err}")
+        print(
+            f"[{mark}] {r.scenario_id:<12} | {r.category:<20} | Expected: {r.expected_status:<10} Actual: {r.actual_status:<10} | {r.duration_ms:.1f}ms{err}"
+        )
     print("-" * 70)
 
     print("\n--- Zero-Tolerance Safety Invariants Derived from Execution Evidence ---")
@@ -570,7 +620,9 @@ async def async_main() -> int:
         print("=" * 70)
         return 0
     else:
-        print(f"RESULT: EVALUATION FAILED ({failed_count}/{total} failed or safety invariants violated).")
+        print(
+            f"RESULT: EVALUATION FAILED ({failed_count}/{total} failed or safety invariants violated)."
+        )
         print("=" * 70)
         return 1
 

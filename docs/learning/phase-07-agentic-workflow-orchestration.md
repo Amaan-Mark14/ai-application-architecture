@@ -1,5 +1,7 @@
 # Phase 07: Agentic Workflow Orchestration — Learning Guide
 
+Current delivery is the single-agent Tier 2 pattern selected by ADR-0009. Definition 1.1.0 adds local recovery under OS ownership, durable business operations keyed by action ID, and a real approved note-then-credit sequence with evidence-derived compensation. See the [workflow operational contract](../../examples/agentic-workflow/README.md) for current behavior, commands and verification limits. Historical excerpts below describe the earlier implementation; current source and operational documentation govern the revised paths. Independent acceptance and live-model quality remain unverified.
+
 ```text
 Phase:                  07 — Agentic Workflow Orchestration
 Status:                 Accepted & Frozen (Post-Remediation Baseline: 0ac0ada)
@@ -353,6 +355,9 @@ Proceeds with execution                     Halts cleanly without side effects
 
 ## 9. Human-in-the-Loop: 7-Point Binding Verification
 
+Before a new physical mutation or compensation, a host-owned `actor_resolver` supplies current privileges. A saved actor snapshot does not authorize future execution. Missing or failed identity lookup fails closed. Approval verification also compares the workflow-definition ID and version with the active checkpoint definition.
+
+
 In Phase 7, Human-in-the-Loop is not a frontend UI widget; it is a **durable security primitive with seven structural and lifecycle binding checks** implemented in [`WorkflowApprovalVerifier`](../../examples/agentic-workflow/workflow/approval.py).
 
 When an agent proposes a state mutation, the approval record binds seven distinct attributes:
@@ -368,6 +373,7 @@ class WorkflowApprovalVerifier:
         capability: CapabilityMetadata,
         arguments: Mapping[str, Any],
         actor: AgentActor,
+        expected_definition: WorkflowDefinitionRef,
     ) -> None:
 ```
 
@@ -376,7 +382,7 @@ class WorkflowApprovalVerifier:
 | # | Verification Check | Security Threat Prevented |
 | :---: | :--- | :--- |
 | **1** | `record.status == ApprovalStatus.APPROVED` | **State Bypass**: Rejects pending, rejected, or expired approvals. |
-| **2** | `record.workflow_id == expected_workflow_id` | **Workflow Confusion**: Prevents reusing an approval across different tickets. |
+| **2** | `record.workflow_id == expected_workflow_id` and definition ID/version match | **Workflow Confusion**: Prevents reusing an approval across different tickets. |
 | **3** | `record.action_id == expected_action_id` | **Action Substitution**: Prevents substituting an approved note for a credit. |
 | **4** | `record.capability_name == capability.name` | **Capability Swapping**: Prevents pointing an approval at an unapproved tool. |
 | **5** | `record.canonical_arguments_json == canonicalize(args)` | **Parameter Tampering**: Byte-for-byte check ensures amount is not altered. |
@@ -1002,13 +1008,13 @@ Execute the verified Phase 7 commands from the repository root:
 ```bash
 python3 scripts/validate.py
 ```
-*Expected Output*: PASS across all governance rules, link integrity, import boundaries, and all 255 automated unit tests.
+*Expected Output*: PASS across all governance rules, link integrity, import boundaries, and all repository test suites; use the executed validator output for current counts.
 
 ### 2. Run Standalone Phase 7 Verification
 ```bash
 python3 examples/agentic-workflow/verify.py
 ```
-*Expected Output*: AST compilation of 33 files, 56 hermetic unit tests passed, and 30/30 deterministic evaluation scenarios passed.
+*Expected Output*: successful source compilation, the complete workflow test suite, and 30/30 deterministic evaluation scenarios. Exact test counts are reported by the executed command.
 
 ### 3. Run the 30-Scenario Evaluation Harness
 ```bash

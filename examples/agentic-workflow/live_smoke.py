@@ -19,7 +19,6 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Mapping, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 BUILDING_BLOCKS_DIR = REPO_ROOT / "building-blocks" / "python"
@@ -44,7 +43,7 @@ from agent.engine import AgentExecutionEngine
 from agent.executor import ToolExecutor
 from agent.policy import CustomerSupportAuthorizationPolicy
 from agent.registry import CapabilityRegistry
-from contracts.agent import AgentActor, SideEffectLevel
+from contracts.agent import AgentActor
 from contracts.workflow import WorkflowStatus
 from ollama_adapter.adapter import OllamaAdapter
 from workflow.engine import WorkflowEngine
@@ -73,16 +72,18 @@ async def run_live_smoke(
         print("=" * 70)
         print("STATUS: NOT VERIFIED")
         print(f"Reason: Ollama daemon is unreachable at '{endpoint}'.")
-        print("Note: In offline environments or CI without local GPU/Ollama, live verification is skipped.")
+        print(
+            "Note: In offline environments or CI without local GPU/Ollama, live verification is skipped."
+        )
         print("      To run live verification, start Ollama locally (`ollama serve`).")
         print("=" * 70)
         return 0 if allow_unverified else 1
 
     installed_models = await adapter.get_installed_models()
-    print(f"Ollama Daemon: Reachable (HTTP 200 OK)")
+    print("Ollama Daemon: Reachable (HTTP 200 OK)")
     print(f"Installed Models: {installed_models if installed_models else 'None'}")
 
-    matched_model: Optional[str] = None
+    matched_model: str | None = None
     for m in installed_models:
         if m == model_name or m.startswith(f"{model_name}:"):
             matched_model = m
@@ -119,7 +120,9 @@ async def run_live_smoke(
 
         # Build real Phase 6 AgentEngine wired to local Ollama and READ-ONLY tools
         live_agent_engine = AgentExecutionEngine(
-            llm_client=OllamaAdapter(endpoint=endpoint, default_model=effective_model, timeout_seconds=30.0),
+            llm_client=OllamaAdapter(
+                endpoint=endpoint, default_model=effective_model, timeout_seconds=30.0
+            ),
             registry=read_only_registry,
             policy=auth_policy,
             approval_handler=DeterministicApprovalHandler(default_approved=True),
@@ -137,6 +140,7 @@ async def run_live_smoke(
             tool_executor=executor,
             workflow_store=sqlite_store,
             auth_policy=auth_policy,
+            actor_resolver={"live_operator_1": AgentActor("live_operator_1", "senior_agent")}.get,
         )
 
         workflow_engine = WorkflowEngine(definition=workflow_def, store=sqlite_store)
@@ -195,7 +199,9 @@ async def run_live_smoke(
 
         # If it reached awaiting_approval (the model proposed fee credit), test resume!
         if state_2.status == WorkflowStatus.AWAITING_APPROVAL:
-            print("\nModel generated a valid fee credit proposal! Testing operator approval resume...")
+            print(
+                "\nModel generated a valid fee credit proposal! Testing operator approval resume..."
+            )
             state_2_resumed = await workflow_engine.resume_workflow(
                 workflow_id="wf-live-002",
                 decision="approved",
@@ -204,7 +210,9 @@ async def run_live_smoke(
             )
             print(f"Resumed Status:   {state_2_resumed.status.value.upper()}")
             print(f"Current Step:     {state_2_resumed.current_step}")
-            print(f"Final Balance:    ${customer_store.get_account('cust-001').balance_cents / 100:.2f}")
+            final_account = customer_store.get_account("cust-001")
+            assert final_account is not None
+            print(f"Final Balance:    ${final_account.balance_cents / 100:.2f}")
 
         print("\n" + "=" * 70)
         print("STATUS: VERIFIED")
@@ -216,9 +224,13 @@ async def run_live_smoke(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live Local Ollama Smoke Verification for Phase 7")
-    parser.add_argument("--endpoint", type=str, default="http://localhost:11434", help="Ollama API endpoint")
+    parser.add_argument(
+        "--endpoint", type=str, default="http://localhost:11434", help="Ollama API endpoint"
+    )
     parser.add_argument("--model", type=str, default="llama3.2", help="Ollama model name")
-    parser.add_argument("--allow-unverified", action="store_true", help="Exit 0 even if daemon is unreachable")
+    parser.add_argument(
+        "--allow-unverified", action="store_true", help="Exit 0 even if daemon is unreachable"
+    )
     args = parser.parse_args()
 
     exit_code = asyncio.run(

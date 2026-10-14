@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any, List
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 BUILDING_BLOCKS_DIR = REPO_ROOT / "building-blocks" / "python"
@@ -57,7 +57,9 @@ class StubAgentEngine:
 
 
 class StubApprovalHandler(ApprovalPort):
-    async def request_approval(self, actor: AgentActor, capability: CapabilityMetadata, arguments: Any) -> ApprovalDecision:
+    async def request_approval(
+        self, actor: AgentActor, capability: CapabilityMetadata, arguments: Any
+    ) -> ApprovalDecision:
         return ApprovalDecision(approved=True, approver="test_approver")
 
 
@@ -69,6 +71,7 @@ class TestConcurrentResume(unittest.IsolatedAsyncioTestCase):
         self.db_path = os.path.join(self.temp_dir.name, "concurrent_test.db")
         self.customer_store = InMemoryCustomerStore()
         self.auth_policy = CustomerSupportAuthorizationPolicy(store=self.customer_store)
+        self.current_actors = {"operator_bob": AgentActor("operator_bob", "senior_agent")}
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -93,6 +96,7 @@ class TestConcurrentResume(unittest.IsolatedAsyncioTestCase):
             tool_executor=executor,
             workflow_store=sqlite_store,
             auth_policy=self.auth_policy,
+            actor_resolver=self.current_actors.get,
         )
 
         return WorkflowEngine(definition=workflow_def, store=sqlite_store)
@@ -107,7 +111,7 @@ class TestConcurrentResume(unittest.IsolatedAsyncioTestCase):
         state = await engine_setup.start_workflow(
             workflow_id=wf_id,
             actor=actor,
-            domain_context={"customer_id": "cust-001", "description": "Overdraft dispute"},
+            domain_context={"customer_id": "cust-001", "inquiry": "Overdraft dispute"},
         )
         self.assertEqual(state.status, WorkflowStatus.AWAITING_APPROVAL)
 
@@ -115,8 +119,8 @@ class TestConcurrentResume(unittest.IsolatedAsyncioTestCase):
         engine_1 = self._create_engine()
         engine_2 = self._create_engine()
 
-        successes: List[Any] = []
-        conflicts: List[Exception] = []
+        successes: list[Any] = []
+        conflicts: list[Exception] = []
 
         async def attempt_resume(engine: WorkflowEngine, approver_name: str) -> None:
             try:
@@ -128,8 +132,6 @@ class TestConcurrentResume(unittest.IsolatedAsyncioTestCase):
                 )
                 successes.append(res)
             except ConcurrentResumeConflictError as exc:
-                conflicts.append(exc)
-            except Exception as exc:
                 conflicts.append(exc)
 
         # Launch concurrent resume attempts simultaneously

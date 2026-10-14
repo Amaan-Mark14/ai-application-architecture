@@ -5,8 +5,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 BUILDING_BLOCKS_DIR = REPO_ROOT / "building-blocks" / "python"
@@ -80,11 +81,14 @@ class TestHitlProcessRestart(unittest.IsolatedAsyncioTestCase):
         self.db_path = os.path.join(self.temp_dir.name, "workflow_restart_test.db")
         self.customer_store = InMemoryCustomerStore()
         self.auth_policy = CustomerSupportAuthorizationPolicy(store=self.customer_store)
+        self.current_actors = {"operator_bob": AgentActor("operator_bob", "senior_agent")}
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def _create_engine(self, db_path: str, proposal_type: str = "fee_credit", amount_cents: int = 2500) -> WorkflowEngine:
+    def _create_engine(
+        self, db_path: str, proposal_type: str = "fee_credit", amount_cents: int = 2500
+    ) -> WorkflowEngine:
         sqlite_store = SQLiteWorkflowStore(db_path)
         read_only_caps = [
             GetCustomerCapability(self.customer_store),
@@ -108,6 +112,7 @@ class TestHitlProcessRestart(unittest.IsolatedAsyncioTestCase):
             tool_executor=executor,
             workflow_store=sqlite_store,
             auth_policy=self.auth_policy,
+            actor_resolver=self.current_actors.get,
         )
 
         return WorkflowEngine(definition=workflow_def, store=sqlite_store)
@@ -122,12 +127,14 @@ class TestHitlProcessRestart(unittest.IsolatedAsyncioTestCase):
         state_a = await engine_a.start_workflow(
             workflow_id=wf_id,
             actor=actor,
-            domain_context={"customer_id": "cust-001", "description": "Overdraft dispute"},
+            domain_context={"customer_id": "cust-001", "inquiry": "Overdraft dispute"},
         )
 
         self.assertEqual(state_a.status, WorkflowStatus.AWAITING_APPROVAL)
         self.assertEqual(state_a.current_step, "human_approval")
-        self.assertEqual(state_a.checkpoint_version, 5)  # initial=1, intake=2, context=3, agentic=4, human=5
+        self.assertEqual(
+            state_a.checkpoint_version, 5
+        )  # initial=1, intake=2, context=3, agentic=4, human=5
 
         # Verify physical customer balance is UNTOUCHED
         acc_after_a = self.customer_store.get_account("cust-001")
@@ -186,7 +193,7 @@ class TestHitlProcessRestart(unittest.IsolatedAsyncioTestCase):
         state_a = await engine_a.start_workflow(
             workflow_id=wf_id,
             actor=actor,
-            domain_context={"customer_id": "cust-001", "description": "Overdraft dispute"},
+            domain_context={"customer_id": "cust-001", "inquiry": "Overdraft dispute"},
         )
         self.assertEqual(state_a.status, WorkflowStatus.AWAITING_APPROVAL)
         del engine_a
@@ -223,10 +230,13 @@ class TestHitlProcessRestart(unittest.IsolatedAsyncioTestCase):
             [
                 sys.executable,
                 str(demo_py),
-                "--db", db_file,
+                "--db",
+                db_file,
                 "start",
-                "--customer", "cust-001",
-                "--inquiry", "Dispute fee concession refund",
+                "--customer",
+                "cust-001",
+                "--inquiry",
+                "Dispute fee concession refund",
             ],
             capture_output=True,
             text=True,
@@ -249,9 +259,11 @@ class TestHitlProcessRestart(unittest.IsolatedAsyncioTestCase):
             [
                 sys.executable,
                 str(demo_py),
-                "--db", db_file,
+                "--db",
+                db_file,
                 "status",
-                "--workflow-id", wf_id,
+                "--workflow-id",
+                wf_id,
             ],
             capture_output=True,
             text=True,
@@ -265,10 +277,13 @@ class TestHitlProcessRestart(unittest.IsolatedAsyncioTestCase):
             [
                 sys.executable,
                 str(demo_py),
-                "--db", db_file,
+                "--db",
+                db_file,
                 "approve",
-                "--workflow-id", wf_id,
-                "--approver", "manager_charlie",
+                "--workflow-id",
+                wf_id,
+                "--approver",
+                "manager_charlie",
             ],
             capture_output=True,
             text=True,

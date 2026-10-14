@@ -23,7 +23,6 @@ from contracts.workflow import (
     WorkflowDefinitionRef,
     WorkflowStatus,
 )
-
 from workflow.approval import DurableApprovalRecord
 from workflow.audit import WorkflowAuditEvent
 from workflow.errors import CorruptedCheckpointError
@@ -52,6 +51,35 @@ class TestSQLiteWorkflowStore(unittest.TestCase):
         mode = cursor.fetchone()[0]
         conn.close()
         self.assertEqual(mode.lower(), "wal")
+
+    def test_transaction_commits_and_closes_connection(self) -> None:
+        with self.store._get_connection() as connection:
+            connection.execute("CREATE TABLE close_probe (value TEXT)")
+            connection.execute("INSERT INTO close_probe VALUES ('committed')")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+        with self.store._get_connection() as reopened:
+            self.assertEqual(
+                reopened.execute("SELECT value FROM close_probe").fetchone()[0], "committed"
+            )
+
+    def test_failed_transaction_rolls_back_and_closes_connection(self) -> None:
+        with self.store._get_connection() as setup:
+            setup.execute("CREATE TABLE rollback_probe (value TEXT)")
+        with (
+            self.assertRaisesRegex(RuntimeError, "Interrupted write"),
+            self.store._get_connection() as connection,
+        ):
+            connection.execute("INSERT INTO rollback_probe VALUES ('must roll back')")
+            raise RuntimeError("Interrupted write")
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+        with self.store._get_connection() as reopened:
+            self.assertEqual(
+                reopened.execute("SELECT count(*) FROM rollback_probe").fetchone()[0], 0
+            )
+        # Windows must be able to unlink the database while the store object is still alive.
+        os.unlink(self.db_path)
 
     def test_save_and_load_workflow_state(self) -> None:
         state = WorkflowState(
@@ -86,13 +114,13 @@ class TestSQLiteWorkflowStore(unittest.TestCase):
         # Directly tamper with SQLite state_json without updating checksum
         conn = sqlite3.connect(self.db_path)
         conn.execute(
-            "UPDATE workflow_checkpoints SET state_json = '{\"workflow_id\": \"wf-corrupt\", \"tampered\": true}' "
+            'UPDATE workflow_checkpoints SET state_json = \'{"workflow_id": "wf-corrupt", "tampered": true}\' '
             "WHERE workflow_id = 'wf-corrupt';"
         )
         conn.commit()
         conn.close()
 
-        with self.assertRaises(Exception):
+        with self.assertRaises(CorruptedCheckpointError):
             self.store.load_state("wf-corrupt")
 
     def test_compare_and_swap_resume(self) -> None:
@@ -120,7 +148,9 @@ class TestSQLiteWorkflowStore(unittest.TestCase):
         self.assertFalse(fail_old)
 
         # 3. Competing CAS when status is already RUNNING -> False
-        fail_status = self.store.compare_and_swap_resume("wf-cas", expected_version=4, new_version=5)
+        fail_status = self.store.compare_and_swap_resume(
+            "wf-cas", expected_version=4, new_version=5
+        )
         self.assertFalse(fail_status)
 
     def test_approval_record_persistence(self) -> None:

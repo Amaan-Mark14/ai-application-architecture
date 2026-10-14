@@ -3,6 +3,7 @@
 import sys
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -15,12 +16,13 @@ for p in (BUILDING_BLOCKS_DIR, AGENT_EXEC_DIR, WORKFLOW_DIR):
         sys.path.insert(0, str(p))
 
 from contracts.agent import AgentActor, CapabilityMetadata, SideEffectLevel
-from contracts.workflow import ApprovalStatus
+from contracts.workflow import ApprovalStatus, WorkflowDefinitionRef
 from workflow.approval import (
     DurableApprovalRecord,
     WorkflowApprovalAdapter,
     WorkflowApprovalVerifier,
     canonicalize_arguments,
+    resolve_current_actor,
 )
 from workflow.errors import (
     ApprovalMismatchError,
@@ -67,28 +69,53 @@ class TestWorkflowApprovalVerifier(unittest.TestCase):
 
     def test_verify_success_with_exact_bindings(self) -> None:
         """When all 7 bindings match exactly, verification succeeds without error."""
-        try:
-            WorkflowApprovalVerifier.verify(
-                record=self.valid_record,
-                expected_workflow_id=self.workflow_id,
-                expected_action_id=self.action_id,
-                capability=self.capability,
-                arguments=self.args,
-                actor=self.actor,
-            )
-        except Exception as exc:
-            self.fail(f"Verification unexpectedly failed: {exc}")
+        WorkflowApprovalVerifier.verify(
+            record=self.valid_record,
+            expected_workflow_id=self.workflow_id,
+            expected_action_id=self.action_id,
+            expected_definition=WorkflowDefinitionRef("customer_account_remediation", "1.0.0"),
+            capability=self.capability,
+            arguments=self.args,
+            actor=self.actor,
+        )
+
+    def test_definition_identity_and_version_must_match(self) -> None:
+        for record in (
+            replace(self.valid_record, workflow_definition_id="different_definition"),
+            replace(self.valid_record, workflow_definition_version="2.0.0"),
+        ):
+            with (
+                self.subTest(
+                    definition=record.workflow_definition_id,
+                    version=record.workflow_definition_version,
+                ),
+                self.assertRaises(ApprovalMismatchError),
+            ):
+                WorkflowApprovalVerifier.verify(
+                    record,
+                    self.workflow_id,
+                    self.action_id,
+                    self.capability,
+                    self.args,
+                    self.actor,
+                    WorkflowDefinitionRef("customer_account_remediation", "1.0.0"),
+                )
 
     def test_verify_rejects_already_consumed_approval(self) -> None:
         """Replay check: A CONSUMED approval must raise ApprovalReplayError."""
         consumed_record = DurableApprovalRecord(
-            **{**self.valid_record.to_dict(), "status": ApprovalStatus.CONSUMED.value, "consumed_at": time.time()}
+            **{
+                **self.valid_record.to_dict(),
+                "status": ApprovalStatus.CONSUMED.value,
+                "consumed_at": time.time(),
+            }
         )
         with self.assertRaises(ApprovalReplayError):
             WorkflowApprovalVerifier.verify(
                 record=consumed_record,
                 expected_workflow_id=self.workflow_id,
                 expected_action_id=self.action_id,
+                expected_definition=WorkflowDefinitionRef("customer_account_remediation", "1.0.0"),
                 capability=self.capability,
                 arguments=self.args,
                 actor=self.actor,
@@ -104,6 +131,7 @@ class TestWorkflowApprovalVerifier(unittest.TestCase):
                 record=pending_record,
                 expected_workflow_id=self.workflow_id,
                 expected_action_id=self.action_id,
+                expected_definition=WorkflowDefinitionRef("customer_account_remediation", "1.0.0"),
                 capability=self.capability,
                 arguments=self.args,
                 actor=self.actor,
@@ -116,6 +144,7 @@ class TestWorkflowApprovalVerifier(unittest.TestCase):
                 record=self.valid_record,
                 expected_workflow_id="wf-DIFFERENT-999",
                 expected_action_id=self.action_id,
+                expected_definition=WorkflowDefinitionRef("customer_account_remediation", "1.0.0"),
                 capability=self.capability,
                 arguments=self.args,
                 actor=self.actor,
@@ -128,6 +157,7 @@ class TestWorkflowApprovalVerifier(unittest.TestCase):
                 record=self.valid_record,
                 expected_workflow_id=self.workflow_id,
                 expected_action_id="act-wf-test-001-mutation-OTHER",
+                expected_definition=WorkflowDefinitionRef("def-1", "1.0.0"),
                 capability=self.capability,
                 arguments=self.args,
                 actor=self.actor,
@@ -146,6 +176,7 @@ class TestWorkflowApprovalVerifier(unittest.TestCase):
                 record=self.valid_record,
                 expected_workflow_id=self.workflow_id,
                 expected_action_id=self.action_id,
+                expected_definition=WorkflowDefinitionRef("customer_account_remediation", "1.0.0"),
                 capability=other_cap,
                 arguments=self.args,
                 actor=self.actor,
@@ -159,6 +190,7 @@ class TestWorkflowApprovalVerifier(unittest.TestCase):
                 record=self.valid_record,
                 expected_workflow_id=self.workflow_id,
                 expected_action_id=self.action_id,
+                expected_definition=WorkflowDefinitionRef("customer_account_remediation", "1.0.0"),
                 capability=self.capability,
                 arguments=tampered_args,
                 actor=self.actor,
@@ -172,6 +204,7 @@ class TestWorkflowApprovalVerifier(unittest.TestCase):
                 record=self.valid_record,
                 expected_workflow_id=self.workflow_id,
                 expected_action_id=self.action_id,
+                expected_definition=WorkflowDefinitionRef("customer_account_remediation", "1.0.0"),
                 capability=self.capability,
                 arguments=self.args,
                 actor=impostor,
@@ -187,6 +220,7 @@ class TestWorkflowApprovalVerifier(unittest.TestCase):
                 record=expired_record,
                 expected_workflow_id=self.workflow_id,
                 expected_action_id=self.action_id,
+                expected_definition=WorkflowDefinitionRef("customer_account_remediation", "1.0.0"),
                 capability=self.capability,
                 arguments=self.args,
                 actor=self.actor,
@@ -195,6 +229,17 @@ class TestWorkflowApprovalVerifier(unittest.TestCase):
 
 class TestWorkflowApprovalAdapter(unittest.IsolatedAsyncioTestCase):
     """Verify that WorkflowApprovalAdapter cleanly implements Phase 6 ApprovalPort."""
+
+    def test_current_actor_lookup_fails_closed(self) -> None:
+        for resolver in (None, {}.get, {"bob": AgentActor("another_actor", "admin")}.get):
+            with self.subTest(resolver=resolver), self.assertRaises(PermissionError):
+                resolve_current_actor("bob", resolver)
+
+    def test_current_actor_lookup_returns_fresh_permissions(self) -> None:
+        current = AgentActor("bob", "senior_agent", ["current_permission"])
+        self.assertEqual(
+            resolve_current_actor("bob", {"bob": current}.get).permissions, ["current_permission"]
+        )
 
     async def test_adapter_approves_when_verifier_passes(self) -> None:
         workflow_id = "wf-adapt-001"
@@ -225,6 +270,7 @@ class TestWorkflowApprovalAdapter(unittest.IsolatedAsyncioTestCase):
             approval_record=rec,
             expected_workflow_id=workflow_id,
             expected_action_id=action_id,
+            expected_definition=WorkflowDefinitionRef("def-1", "1.0.0"),
         )
 
         decision = await adapter.request_approval(actor, capability, args)
@@ -260,6 +306,7 @@ class TestWorkflowApprovalAdapter(unittest.IsolatedAsyncioTestCase):
             approval_record=rec,
             expected_workflow_id=workflow_id,
             expected_action_id=action_id,
+            expected_definition=WorkflowDefinitionRef("def-1", "1.0.0"),
         )
 
         # Pass altered arguments

@@ -18,7 +18,7 @@ from agent.capabilities import ApplyFeeCreditCapability
 from agent.domain import InMemoryCustomerStore
 from agent.executor import ToolExecutor
 from agent.policy import CustomerSupportAuthorizationPolicy
-from contracts.agent import ExecutionReceipt
+from contracts.agent import AgentActor, ExecutionReceipt
 from contracts.workflow import (
     ApprovalStatus,
     MutationStatus,
@@ -112,6 +112,7 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.customer_store = InMemoryCustomerStore()
         self.auth_policy = CustomerSupportAuthorizationPolicy(store=self.customer_store)
+        self.current_actors = {"operator_bob": AgentActor("operator_bob", "senior_agent")}
         self.workflow_store = InMemoryWorkflowStore()
         self.tool_executor = ToolExecutor()
         self.credit_cap = ApplyFeeCreditCapability(self.customer_store)
@@ -123,7 +124,9 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             workflow_id=wf_id,
             step_name="mutation_execution",
             capability_name="apply_fee_credit",
-            canonical_args=canonicalize_arguments({"amount_cents": 1000, "customer_id": "cust-001", "reason": "overdraft concession"}),
+            canonical_args=canonicalize_arguments(
+                {"amount_cents": 1000, "customer_id": "cust-001", "reason": "overdraft concession"}
+            ),
         )
 
         # Baseline: cust-001 balance is 15000 cents
@@ -139,7 +142,9 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             workflow_id=wf_id,
             step_name="mutation_execution",
             capability_name="apply_fee_credit",
-            canonical_args=canonicalize_arguments({"amount_cents": 1000, "customer_id": "cust-001", "reason": "overdraft concession"}),
+            canonical_args=canonicalize_arguments(
+                {"amount_cents": 1000, "customer_id": "cust-001", "reason": "overdraft concession"}
+            ),
             status=MutationStatus.EXECUTION_STARTED,
             created_at=time.time() - 10,
             updated_at=time.time() - 10,
@@ -154,7 +159,9 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             workflow_definition_version="1.0.0",
             action_id=action_id,
             capability_name="apply_fee_credit",
-            canonical_arguments_json=canonicalize_arguments({"amount_cents": 1000, "customer_id": "cust-001", "reason": "overdraft concession"}),
+            canonical_arguments_json=canonicalize_arguments(
+                {"amount_cents": 1000, "customer_id": "cust-001", "reason": "overdraft concession"}
+            ),
             actor_id="operator_bob",
             actor_role="senior_agent",
             status=ApprovalStatus.APPROVED,
@@ -179,6 +186,7 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             tool_executor=self.tool_executor,
             store=self.workflow_store,
             policy=self.auth_policy,
+            actor_resolver=self.current_actors.get,
             reconciler=reconcile_credit,
         )
 
@@ -190,7 +198,11 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             initiator_actor=WorkflowActorSnapshot("operator_bob", "senior_agent"),
             domain_context={
                 "customer_id": "cust-001",
-                "target_arguments": {"amount_cents": 1000, "customer_id": "cust-001", "reason": "overdraft concession"},
+                "target_arguments": {
+                    "amount_cents": 1000,
+                    "customer_id": "cust-001",
+                    "reason": "overdraft concession",
+                },
                 "stable_action_id": action_id,
                 "pending_approval_id": "app-ambig-1",
             },
@@ -223,7 +235,9 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             workflow_id=wf_id,
             step_name="mutation_execution",
             capability_name="apply_fee_credit",
-            canonical_args=canonicalize_arguments({"amount_cents": 1000, "customer_id": "cust-001", "reason": "unapplied concession"}),
+            canonical_args=canonicalize_arguments(
+                {"amount_cents": 1000, "customer_id": "cust-001", "reason": "unapplied concession"}
+            ),
         )
 
         # Initial balance: 15000 cents
@@ -235,7 +249,9 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             workflow_id=wf_id,
             step_name="mutation_execution",
             capability_name="apply_fee_credit",
-            canonical_args=canonicalize_arguments({"amount_cents": 1000, "customer_id": "cust-001", "reason": "unapplied concession"}),
+            canonical_args=canonicalize_arguments(
+                {"amount_cents": 1000, "customer_id": "cust-001", "reason": "unapplied concession"}
+            ),
             status=MutationStatus.EXECUTION_STARTED,
             created_at=time.time() - 10,
             updated_at=time.time() - 10,
@@ -249,7 +265,9 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             workflow_definition_version="1.0.0",
             action_id=action_id,
             capability_name="apply_fee_credit",
-            canonical_arguments_json=canonicalize_arguments({"amount_cents": 1000, "customer_id": "cust-001", "reason": "unapplied concession"}),
+            canonical_arguments_json=canonicalize_arguments(
+                {"amount_cents": 1000, "customer_id": "cust-001", "reason": "unapplied concession"}
+            ),
             actor_id="operator_bob",
             actor_role="senior_agent",
             status=ApprovalStatus.APPROVED,
@@ -269,6 +287,7 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             tool_executor=self.tool_executor,
             store=self.workflow_store,
             policy=self.auth_policy,
+            actor_resolver=self.current_actors.get,
             reconciler=reconcile_credit,
         )
 
@@ -280,7 +299,11 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             initiator_actor=WorkflowActorSnapshot("operator_bob", "senior_agent"),
             domain_context={
                 "customer_id": "cust-001",
-                "target_arguments": {"amount_cents": 1000, "customer_id": "cust-001", "reason": "unapplied concession"},
+                "target_arguments": {
+                    "amount_cents": 1000,
+                    "customer_id": "cust-001",
+                    "reason": "unapplied concession",
+                },
                 "stable_action_id": action_id,
                 "pending_approval_id": "app-ambig-2",
             },
@@ -291,8 +314,12 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.status, StepExecutionStatus.SUCCEEDED)
         # Executed safely once
         self.assertEqual(self.customer_store.get_account("cust-001").balance_cents, 16000)
-        self.assertEqual(self.workflow_store.load_mutation(action_id).status, MutationStatus.EXECUTED)
-        self.assertEqual(self.workflow_store.load_approval("app-ambig-2").status, ApprovalStatus.CONSUMED)
+        self.assertEqual(
+            self.workflow_store.load_mutation(action_id).status, MutationStatus.EXECUTED
+        )
+        self.assertEqual(
+            self.workflow_store.load_approval("app-ambig-2").status, ApprovalStatus.CONSUMED
+        )
 
     async def test_in_flight_recovery_inconclusive_halts_safely_without_mutation(self) -> None:
         """When domain state reconciliation is inconclusive, recovery marks AMBIGUOUS and halts safely."""
@@ -301,7 +328,9 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             workflow_id=wf_id,
             step_name="mutation_execution",
             capability_name="apply_fee_credit",
-            canonical_args=canonicalize_arguments({"amount_cents": 1000, "customer_id": "cust-001", "reason": "inconclusive test"}),
+            canonical_args=canonicalize_arguments(
+                {"amount_cents": 1000, "customer_id": "cust-001", "reason": "inconclusive test"}
+            ),
         )
 
         self.assertEqual(self.customer_store.get_account("cust-001").balance_cents, 15000)
@@ -311,7 +340,9 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             workflow_id=wf_id,
             step_name="mutation_execution",
             capability_name="apply_fee_credit",
-            canonical_args=canonicalize_arguments({"amount_cents": 1000, "customer_id": "cust-001", "reason": "inconclusive test"}),
+            canonical_args=canonicalize_arguments(
+                {"amount_cents": 1000, "customer_id": "cust-001", "reason": "inconclusive test"}
+            ),
             status=MutationStatus.EXECUTION_STARTED,
             created_at=time.time() - 10,
             updated_at=time.time() - 10,
@@ -326,6 +357,7 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             tool_executor=self.tool_executor,
             store=self.workflow_store,
             policy=self.auth_policy,
+            actor_resolver=self.current_actors.get,
             reconciler=reconcile_inconclusive,
         )
 
@@ -337,7 +369,11 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
             initiator_actor=WorkflowActorSnapshot("operator_bob", "senior_agent"),
             domain_context={
                 "customer_id": "cust-001",
-                "target_arguments": {"amount_cents": 1000, "customer_id": "cust-001", "reason": "inconclusive test"},
+                "target_arguments": {
+                    "amount_cents": 1000,
+                    "customer_id": "cust-001",
+                    "reason": "inconclusive test",
+                },
                 "stable_action_id": action_id,
             },
         )
@@ -353,7 +389,9 @@ class TestAmbiguousMutationRecovery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.customer_store.get_account("cust-001").balance_cents, 15000)
 
         # Ledger marked AMBIGUOUS
-        self.assertEqual(self.workflow_store.load_mutation(action_id).status, MutationStatus.AMBIGUOUS)
+        self.assertEqual(
+            self.workflow_store.load_mutation(action_id).status, MutationStatus.AMBIGUOUS
+        )
 
 
 if __name__ == "__main__":

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import inspect
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from contracts.workflow import (
-    StepExecutionStatus,
     WorkflowDefinitionRef,
     WorkflowStatus,
 )
@@ -15,7 +13,7 @@ from contracts.workflow import (
 from .errors import InvalidTransitionError, WorkflowDefinitionError
 from .state import StepOutcome, WorkflowState
 
-StepHandler = Callable[[WorkflowState], Union[StepOutcome, Awaitable[StepOutcome]]]
+StepHandler = Callable[[WorkflowState], StepOutcome | Awaitable[StepOutcome]]
 
 
 @dataclass(frozen=True)
@@ -34,11 +32,12 @@ class StepDefinition:
     name: str
     handler: StepHandler
     transitions: Sequence[TransitionRule] = field(default_factory=tuple)
-    default_transition: Optional[str] = None
+    default_transition: str | None = None
     is_terminal: bool = False
-    terminal_status: Optional[WorkflowStatus] = None
+    terminal_status: WorkflowStatus | None = None
     is_mutating: bool = False
     max_retries: int = 0
+    supports_recovery: bool = False
 
     def __post_init__(self) -> None:
         if not self.name or not self.name.strip():
@@ -66,7 +65,7 @@ class WorkflowDefinition:
     ) -> None:
         self.definition_ref = WorkflowDefinitionRef(definition_id=definition_id, version=version)
         self.start_step = start_step
-        self.steps: Dict[str, StepDefinition] = {s.name: s for s in steps}
+        self.steps: dict[str, StepDefinition] = {s.name: s for s in steps}
         self.max_transitions = max_transitions
         self.validate_graph()
 
@@ -112,17 +111,21 @@ class WorkflowDefinition:
                 )
 
         if not has_terminal:
-            raise WorkflowDefinitionError("Workflow definition must declare at least one terminal step.")
+            raise WorkflowDefinitionError(
+                "Workflow definition must declare at least one terminal step."
+            )
 
     def resolve_next_step(
         self,
         state: WorkflowState,
         outcome: StepOutcome,
-    ) -> Tuple[str, Optional[WorkflowStatus]]:
+    ) -> tuple[str, WorkflowStatus | None]:
         """Evaluate declared transition rules against step outcome to determine next step and status."""
         current_step_def = self.steps.get(state.current_step)
         if not current_step_def:
-            raise InvalidTransitionError(f"Current step '{state.current_step}' is not in workflow definition.")
+            raise InvalidTransitionError(
+                f"Current step '{state.current_step}' is not in workflow definition."
+            )
 
         if current_step_def.is_terminal:
             raise InvalidTransitionError(

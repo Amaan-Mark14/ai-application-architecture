@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from typing import Any, Mapping, Optional, Tuple
+from collections.abc import Mapping
+from dataclasses import replace
+from typing import Any, cast
 
 from contracts.workflow import (
     ApprovalStatus,
@@ -13,7 +15,6 @@ from contracts.workflow import (
     WorkflowStatus,
 )
 
-from .approval import DurableApprovalRecord
 from .audit import WorkflowAuditRecorder
 from .definition import WorkflowDefinition
 from .errors import (
@@ -24,6 +25,7 @@ from .errors import (
 )
 from .retry import StepRetryPolicy
 from .state import StepExecutionRecord, StepOutcome, WorkflowActorSnapshot, WorkflowState
+from .store import execution_guard
 
 
 class WorkflowEngine:
@@ -33,8 +35,8 @@ class WorkflowEngine:
         self,
         definition: WorkflowDefinition,
         store: Any,
-        retry_policy: Optional[StepRetryPolicy] = None,
-        audit_recorder: Optional[WorkflowAuditRecorder] = None,
+        retry_policy: StepRetryPolicy | None = None,
+        audit_recorder: WorkflowAuditRecorder | None = None,
     ) -> None:
         self.definition = definition
         self.store = store
@@ -45,8 +47,8 @@ class WorkflowEngine:
         self,
         workflow_id: str,
         event_type: str,
-        step_name: Optional[str] = None,
-        details: Optional[Mapping[str, Any]] = None,
+        step_name: str | None = None,
+        details: Mapping[str, Any] | None = None,
     ) -> Any:
         event = self.audit_recorder.record(
             workflow_id=workflow_id,
@@ -57,15 +59,15 @@ class WorkflowEngine:
         if hasattr(self.store, "append_audit_event"):
             try:
                 self.store.append_audit_event(event)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 -- audit persistence remains best effort.
+                return event
         return event
 
-    async def start_workflow(
+    async def _start_workflow(
         self,
         workflow_id: str,
         actor: WorkflowActorSnapshot,
-        domain_context: Optional[Mapping[str, Any]] = None,
+        domain_context: Mapping[str, Any] | None = None,
     ) -> WorkflowState:
         """Initialize and run a new durable workflow instance."""
         existing = self.store.load_state(workflow_id)
@@ -90,10 +92,30 @@ class WorkflowEngine:
             workflow_id=workflow_id,
             event_type="workflow_started",
             step_name=self.definition.start_step,
-            details={"definition": self.definition.definition_id, "version": self.definition.version},
+            details={
+                "definition": self.definition.definition_id,
+                "version": self.definition.version,
+            },
         )
 
         return await self._run_loop(initial_state)
+
+    async def start_workflow(
+        self,
+        workflow_id: str,
+        actor: WorkflowActorSnapshot,
+        domain_context: Mapping[str, Any] | None = None,
+    ) -> WorkflowState:
+        with execution_guard(self.store, workflow_id):
+            return await self._start_workflow(workflow_id, actor, domain_context)
+
+    def _check_definition(self, state: WorkflowState) -> None:
+        if state.definition != self.definition.definition_ref:
+            raise IncompatibleWorkflowDefinitionError(
+                f"Workflow '{state.workflow_id}' was persisted using definition "
+                f"'{state.definition.definition_id}' v{state.definition.version}, "
+                f"but runtime engine supports '{self.definition.definition_id}' v{self.definition.version}."
+            )
 
     async def resume_workflow(
         self,
@@ -101,133 +123,77 @@ class WorkflowEngine:
         decision: str,
         approver_id: str,
         approver_role: str = "manager",
-        reason: Optional[str] = None,
+        reason: str | None = None,
     ) -> WorkflowState:
-        """Resume a suspended workflow from disk following an operator approval decision."""
-        state = self.store.load_state(workflow_id)
-        if not state:
-            raise ValueError(f"Workflow '{workflow_id}' not found in persistence store.")
-
-        # 1. Workflow definition compatibility check
-        if (
-            state.definition.definition_id != self.definition.definition_id
-            or state.definition.version != self.definition.version
-        ):
-            raise IncompatibleWorkflowDefinitionError(
-                f"Workflow '{workflow_id}' was persisted using definition "
-                f"'{state.definition.definition_id}' v{state.definition.version}, "
-                f"but runtime engine supports '{self.definition.definition_id}' v{self.definition.version}."
-            )
-
-        if state.status != WorkflowStatus.AWAITING_APPROVAL:
-            raise ConcurrentResumeConflictError(
-                f"Workflow '{workflow_id}' cannot be resumed from status '{state.status.value}'. "
-                "Expected 'awaiting_approval' (already in progress or terminal)."
-            )
-
-        # 2. Optimistic Concurrency Control (Compare-and-Swap)
-        next_version = state.checkpoint_version + 1
-        lock_acquired = self.store.compare_and_swap_resume(
-            workflow_id=workflow_id,
-            expected_version=state.checkpoint_version,
-            new_version=next_version,
-        )
-        if not lock_acquired:
-            raise ConcurrentResumeConflictError(
-                f"Concurrent resume conflict for workflow '{workflow_id}'. "
-                "Another process has already acquired execution rights."
-            )
-
-        # Reload updated state with new version and RUNNING status
-        resumed_state = self.store.load_state(workflow_id)
-        assert resumed_state is not None
-
-        # 3. Process Approval Decision
-        approval_id = resumed_state.domain_context.get("pending_approval_id")
-        approval_record = self.store.load_approval(approval_id) if approval_id else None
-
-        decision_clean = decision.strip().lower()
-        now = time.time()
-
-        if decision_clean in ("approve", "approved", "yes", "y"):
-            if approval_record:
-                updated_approval = DurableApprovalRecord(
-                    approval_id=approval_record.approval_id,
-                    workflow_id=approval_record.workflow_id,
-                    workflow_definition_id=approval_record.workflow_definition_id,
-                    workflow_definition_version=approval_record.workflow_definition_version,
-                    action_id=approval_record.action_id,
-                    capability_name=approval_record.capability_name,
-                    canonical_arguments_json=approval_record.canonical_arguments_json,
-                    actor_id=approval_record.actor_id,
-                    actor_role=approval_record.actor_role,
-                    status=ApprovalStatus.APPROVED,
-                    approver_id=approver_id,
-                    approver_role=approver_role,
-                    reason=reason or "Approved by operator at CLI.",
-                    requested_at=approval_record.requested_at,
-                    decided_at=now,
-                    expires_at=approval_record.expires_at,
+        with execution_guard(self.store, workflow_id):
+            state = self.store.load_state(workflow_id)
+            if state is None:
+                raise ValueError(f"Workflow '{workflow_id}' not found in persistence store.")
+            self._check_definition(state)
+            if state.status != WorkflowStatus.AWAITING_APPROVAL:
+                raise ConcurrentResumeConflictError(
+                    f"Workflow '{workflow_id}' cannot be resumed from status '{state.status.value}'."
                 )
-                self.store.save_approval(updated_approval)
-
-            self._record_audit(
-                workflow_id=workflow_id,
-                event_type="approval_decided",
-                details={"decision": "approved", "approver": approver_id, "reason": reason},
+            if not isinstance(decision, str) or decision.strip().lower() not in (
+                "approve",
+                "approved",
+                "yes",
+                "y",
+                "reject",
+                "rejected",
+                "no",
+                "n",
+            ):
+                raise ValueError("Unrecognized approval decision.")
+            approved = decision.strip().lower() in ("approve", "approved", "yes", "y")
+            approval = self.store.load_approval(state.domain_context.get("pending_approval_id"))
+            if approval is None or approval.status != ApprovalStatus.PENDING:
+                raise ConcurrentResumeConflictError("No pending approval is available.")
+            decided = replace(
+                approval,
+                status=ApprovalStatus.APPROVED if approved else ApprovalStatus.REJECTED,
+                approver_id=approver_id,
+                approver_role=approver_role,
+                reason=reason,
+                decided_at=time.time(),
             )
-
-            # Advance to mutation execution step
-            step_outcome = StepOutcome(
+            outcome = StepOutcome(
                 status=StepExecutionStatus.SUCCEEDED,
-                outcome_type="approval_granted",
-                context_updates={"approval_decision": "approved", "approver_id": approver_id},
+                outcome_type="approval_granted" if approved else "approval_rejected",
+                context_updates={
+                    "approval_decision": "approved" if approved else "rejected",
+                    "approver_id": approver_id,
+                },
             )
-            next_step, terminal_status = self.definition.resolve_next_step(resumed_state, step_outcome)
-            resumed_state = self._apply_transition(resumed_state, next_step, terminal_status, step_outcome)
-            self.store.save_state(resumed_state)
+            running = replace(state, status=WorkflowStatus.RUNNING)
+            next_step, terminal = self.definition.resolve_next_step(running, outcome)
+            updated = self._apply_transition(running, next_step, terminal, outcome)
+            self.store.commit_approval_transition(state, updated, decided)
+            self._record_audit(
+                workflow_id,
+                "approval_decided",
+                details={
+                    "decision": "approved" if approved else "rejected",
+                    "approver": approver_id,
+                },
+            )
+            return await self._run_loop(updated)
 
-            return await self._run_loop(resumed_state)
-
-        else:
-            # Rejection branch
-            if approval_record:
-                rejected_approval = DurableApprovalRecord(
-                    approval_id=approval_record.approval_id,
-                    workflow_id=approval_record.workflow_id,
-                    workflow_definition_id=approval_record.workflow_definition_id,
-                    workflow_definition_version=approval_record.workflow_definition_version,
-                    action_id=approval_record.action_id,
-                    capability_name=approval_record.capability_name,
-                    canonical_arguments_json=approval_record.canonical_arguments_json,
-                    actor_id=approval_record.actor_id,
-                    actor_role=approval_record.actor_role,
-                    status=ApprovalStatus.REJECTED,
-                    approver_id=approver_id,
-                    approver_role=approver_role,
-                    reason=reason or "Rejected by operator at CLI.",
-                    requested_at=approval_record.requested_at,
-                    decided_at=now,
-                    expires_at=approval_record.expires_at,
+    async def recover_workflow(self, workflow_id: str) -> WorkflowState:
+        """Re-enter an abandoned RUNNING checkpoint under exclusive local ownership."""
+        with execution_guard(self.store, workflow_id):
+            state = self.store.load_state(workflow_id)
+            if state is None:
+                raise ValueError(f"Workflow '{workflow_id}' not found in persistence store.")
+            self._check_definition(state)
+            if state.status != WorkflowStatus.RUNNING:
+                raise ConcurrentResumeConflictError(
+                    "Recovery requires an abandoned RUNNING checkpoint."
                 )
-                self.store.save_approval(rejected_approval)
-
-            self._record_audit(
-                workflow_id=workflow_id,
-                event_type="approval_decided",
-                details={"decision": "rejected", "approver": approver_id, "reason": reason},
-            )
-
-            step_outcome = StepOutcome(
-                status=StepExecutionStatus.SUCCEEDED,
-                outcome_type="approval_rejected",
-                context_updates={"approval_decision": "rejected", "approver_id": approver_id},
-            )
-            next_step, terminal_status = self.definition.resolve_next_step(resumed_state, step_outcome)
-            resumed_state = self._apply_transition(resumed_state, next_step, terminal_status, step_outcome)
-            self.store.save_state(resumed_state)
-
-            return await self._run_loop(resumed_state)
+            step = self.definition.steps.get(state.current_step)
+            if step is None or (step.is_mutating and not step.supports_recovery):
+                raise InvalidTransitionError("Step has no safe mutation recovery contract.")
+            return await self._run_loop(state)
 
     async def _execute_step_handler(self, step_def: Any, state: WorkflowState) -> StepOutcome:
         handler = step_def.handler
@@ -237,11 +203,11 @@ class WorkflowEngine:
             fn = handler
 
         if inspect.iscoroutinefunction(fn):
-            return await fn(state)
+            return cast(StepOutcome, await fn(state))
         res = fn(state)
         if inspect.iscoroutine(res):
-            return await res
-        return res
+            return cast(StepOutcome, await res)
+        return cast(StepOutcome, res)
 
     async def _run_loop(self, state: WorkflowState) -> WorkflowState:
         """Internal execution loop advancing steps according to declared transitions."""
@@ -250,7 +216,9 @@ class WorkflowEngine:
         while not state.status.is_terminal and state.status != WorkflowStatus.AWAITING_APPROVAL:
             step_def = self.definition.steps.get(state.current_step)
             if not step_def:
-                raise InvalidTransitionError(f"Current step '{state.current_step}' not declared in definition.")
+                raise InvalidTransitionError(
+                    f"Current step '{state.current_step}' not declared in definition."
+                )
 
             # Terminal Step Handling
             if step_def.is_terminal:
@@ -308,11 +276,10 @@ class WorkflowEngine:
 
             # Step Execution with Retry Policy
             attempt = 0
-            outcome: Optional[StepOutcome] = None
+            outcome: StepOutcome | None = None
 
             while True:
                 attempt += 1
-                start_time = time.time()
                 self._record_audit(
                     workflow_id=state.workflow_id,
                     event_type="step_started",
@@ -322,11 +289,11 @@ class WorkflowEngine:
 
                 try:
                     outcome = await self._execute_step_handler(step_def, state)
-                    completed_time = time.time()
                     break
-                except Exception as exc:
-                    completed_time = time.time()
-                    if self.retry_policy.is_retryable(exc, attempt, is_state_mutating=step_def.is_mutating):
+                except Exception as exc:  # noqa: BLE001 -- step failures become structured outcomes.
+                    if self.retry_policy.is_retryable(
+                        exc, attempt, is_state_mutating=step_def.is_mutating
+                    ):
                         delay = self.retry_policy.compute_delay_seconds(attempt)
                         self._record_audit(
                             workflow_id=state.workflow_id,
@@ -408,7 +375,7 @@ class WorkflowEngine:
         self,
         state: WorkflowState,
         next_step: str,
-        terminal_status: Optional[WorkflowStatus],
+        terminal_status: WorkflowStatus | None,
         outcome: StepOutcome,
     ) -> WorkflowState:
         now = time.time()
@@ -437,7 +404,11 @@ class WorkflowEngine:
             workflow_id=state.workflow_id,
             event_type="transition_selected",
             step_name=state.current_step,
-            details={"to_step": next_step, "outcome_type": outcome.outcome_type, "status": new_status.value},
+            details={
+                "to_step": next_step,
+                "outcome_type": outcome.outcome_type,
+                "status": new_status.value,
+            },
         )
 
         return WorkflowState(

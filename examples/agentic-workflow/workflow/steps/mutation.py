@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import inspect
 import time
-from typing import Any, Callable, Mapping, Optional, Union
+from collections.abc import Callable, Mapping
+from dataclasses import replace
+from typing import Any
 
 from contracts.agent import (
     AgentActor,
@@ -22,6 +24,7 @@ from ..approval import (
     DurableApprovalRecord,
     WorkflowApprovalVerifier,
     canonicalize_arguments,
+    resolve_current_actor,
 )
 from ..ledger import DurableMutationRecord, generate_stable_action_id
 from ..state import StepOutcome, WorkflowState
@@ -37,7 +40,9 @@ class MutationExecutionStep:
         store: Any,
         policy: Any,
         requires_approval: bool = True,
-        reconciler: Optional[Callable[[str, str, Mapping[str, Any]], Any]] = None,
+        reconciler: Callable[[str, str, Mapping[str, Any]], Any] | None = None,
+        actor_resolver: Callable[[str], AgentActor | None] | None = None,
+        step_name: str = "mutation_execution",
     ) -> None:
         self.capability = capability
         self.tool_executor = tool_executor
@@ -45,14 +50,18 @@ class MutationExecutionStep:
         self.policy = policy
         self.requires_approval = requires_approval
         self.reconciler = reconciler
+        self.actor_resolver = actor_resolver
+        self.step_name = step_name
 
-    def _find_approval_record(self, state: WorkflowState, action_id: str) -> Optional[DurableApprovalRecord]:
+    def _find_approval_record(
+        self, state: WorkflowState, action_id: str
+    ) -> DurableApprovalRecord | None:
         approval_record = self.store.load_approval_by_action_id(action_id)
         if not approval_record:
             approval_id = state.domain_context.get("pending_approval_id")
             if approval_id:
                 approval_record = self.store.load_approval(approval_id)
-        return approval_record
+        return approval_record if isinstance(approval_record, DurableApprovalRecord) else None
 
     async def execute(self, state: WorkflowState) -> StepOutcome:
         target_args = dict(state.domain_context.get("target_arguments", {}))
@@ -67,20 +76,25 @@ class MutationExecutionStep:
 
         action_id = state.domain_context.get("stable_action_id") or generate_stable_action_id(
             workflow_id=state.workflow_id,
-            step_name="mutation_execution",
+            step_name=self.step_name,
             capability_name=self.capability.metadata.name,
             canonical_args=canonical_args,
-        )
-
-        actor = AgentActor(
-            actor_id=state.initiator_actor.actor_id,
-            role=state.initiator_actor.role,
-            permissions=list(state.initiator_actor.permissions),
         )
 
         # 1. Idempotency & In-Flight Recovery Check: Inspect Durable Mutation Ledger
         existing_mutation = self.store.load_mutation(action_id)
         if existing_mutation:
+            if (
+                existing_mutation.workflow_id != state.workflow_id
+                or existing_mutation.step_name != self.step_name
+                or existing_mutation.capability_name != self.capability.metadata.name
+                or existing_mutation.canonical_args != canonical_args
+            ):
+                return StepOutcome(
+                    status=StepExecutionStatus.FAILED,
+                    outcome_type="mutation_identity_mismatch",
+                    error_message="Mutation ledger identity does not match this request.",
+                )
             if existing_mutation.status == MutationStatus.EXECUTED:
                 receipt = existing_mutation.execution_receipt or ExecutionReceipt(
                     action_id=action_id,
@@ -106,7 +120,7 @@ class MutationExecutionStep:
                             reconciliation_result = await res
                         else:
                             reconciliation_result = str(res)
-                    except Exception:
+                    except Exception:  # noqa: BLE001 -- inconclusive reconciliation must fail closed.
                         reconciliation_result = "inconclusive"
 
                 if reconciliation_result == "executed":
@@ -121,7 +135,7 @@ class MutationExecutionStep:
                     reconciled_mutation = DurableMutationRecord(
                         action_id=action_id,
                         workflow_id=state.workflow_id,
-                        step_name="mutation_execution",
+                        step_name=self.step_name,
                         capability_name=self.capability.metadata.name,
                         canonical_args=canonical_args,
                         status=MutationStatus.EXECUTED,
@@ -131,7 +145,10 @@ class MutationExecutionStep:
                     )
 
                     approval_record = self._find_approval_record(state, action_id)
-                    if approval_record and approval_record.status in (ApprovalStatus.APPROVED, ApprovalStatus.PENDING):
+                    if approval_record and approval_record.status in (
+                        ApprovalStatus.APPROVED,
+                        ApprovalStatus.PENDING,
+                    ):
                         consumed_approval = DurableApprovalRecord(
                             approval_id=approval_record.approval_id,
                             workflow_id=approval_record.workflow_id,
@@ -152,7 +169,9 @@ class MutationExecutionStep:
                             execution_receipt_id=receipt.action_id,
                             expires_at=approval_record.expires_at,
                         )
-                        self.store.atomic_commit_mutation_and_approval(reconciled_mutation, consumed_approval)
+                        self.store.atomic_commit_mutation_and_approval(
+                            reconciled_mutation, consumed_approval
+                        )
                     else:
                         self.store.save_mutation(reconciled_mutation)
 
@@ -178,7 +197,7 @@ class MutationExecutionStep:
                     ambiguous_mutation = DurableMutationRecord(
                         action_id=action_id,
                         workflow_id=state.workflow_id,
-                        step_name="mutation_execution",
+                        step_name=self.step_name,
                         capability_name=self.capability.metadata.name,
                         canonical_args=canonical_args,
                         status=MutationStatus.AMBIGUOUS,
@@ -208,11 +227,23 @@ class MutationExecutionStep:
                 return StepOutcome(
                     status=StepExecutionStatus.FAILED,
                     outcome_type="mutation_failed",
-                    error_message=existing_mutation.execution_receipt.error_message if existing_mutation.execution_receipt else "Previous mutation failed.",
-                    receipts=(existing_mutation.execution_receipt,) if existing_mutation.execution_receipt else (),
+                    error_message=existing_mutation.execution_receipt.error_message
+                    if existing_mutation.execution_receipt
+                    else "Previous mutation failed.",
+                    receipts=(existing_mutation.execution_receipt,)
+                    if existing_mutation.execution_receipt
+                    else (),
                 )
 
         # 2. TOCTOU Authorization Revalidation
+        try:
+            actor = resolve_current_actor(state.initiator_actor.actor_id, self.actor_resolver)
+        except Exception as exc:  # noqa: BLE001 -- finalize failures from external execution boundaries.
+            return StepOutcome(
+                status=StepExecutionStatus.FAILED,
+                outcome_type="authorization_denied",
+                error_message=f"Current authorization unavailable: {exc}",
+            )
         auth_decision = self.policy.authorize(actor, self.capability.metadata, target_args)
         if not auth_decision.allowed:
             return StepOutcome(
@@ -222,9 +253,11 @@ class MutationExecutionStep:
             )
 
         # 3. Pre-Execution Approval Verification (7-point binding check)
-        is_mutating = (self.capability.metadata.side_effect_level == SideEffectLevel.STATE_MUTATING)
-        requires_approval = self.requires_approval and (self.capability.metadata.requires_approval or is_mutating)
-        approval_record: Optional[DurableApprovalRecord] = None
+        is_mutating = self.capability.metadata.side_effect_level == SideEffectLevel.STATE_MUTATING
+        requires_approval = self.requires_approval and (
+            self.capability.metadata.requires_approval or is_mutating
+        )
+        approval_record = None
 
         if requires_approval:
             approval_record = self._find_approval_record(state, action_id)
@@ -243,19 +276,20 @@ class MutationExecutionStep:
                     capability=self.capability.metadata,
                     arguments=target_args,
                     actor=actor,
+                    expected_definition=state.definition,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 -- finalize failures from external execution boundaries.
                 return StepOutcome(
                     status=StepExecutionStatus.FAILED,
                     outcome_type="approval_verification_failed",
-                    error_message=f"Approval verification rejected: {str(exc)}",
+                    error_message=f"Approval verification rejected: {exc!s}",
                 )
 
         # 4. Record Intent in Durable Mutation Ledger: EXECUTION_STARTED
         in_flight_mutation = DurableMutationRecord(
             action_id=action_id,
             workflow_id=state.workflow_id,
-            step_name="mutation_execution",
+            step_name=self.step_name,
             capability_name=self.capability.metadata.name,
             canonical_args=canonical_args,
             status=MutationStatus.EXECUTION_STARTED,
@@ -272,6 +306,16 @@ class MutationExecutionStep:
             args_with_id,
             action_id=action_id,
         )
+        if (
+            receipt.status == "succeeded"
+            and isinstance(raw_output, dict)
+            and raw_output.get("success") is False
+        ):
+            receipt = replace(
+                receipt,
+                status="failed",
+                error_message=str(raw_output.get("error", "Business operation rejected")),
+            )
 
         now = time.time()
         # 6. Atomic Commit: Ledger EXECUTED + Approval CONSUMED
@@ -279,7 +323,7 @@ class MutationExecutionStep:
             executed_mutation = DurableMutationRecord(
                 action_id=action_id,
                 workflow_id=state.workflow_id,
-                step_name="mutation_execution",
+                step_name=self.step_name,
                 capability_name=self.capability.metadata.name,
                 canonical_args=canonical_args,
                 status=MutationStatus.EXECUTED,
@@ -327,7 +371,7 @@ class MutationExecutionStep:
             failed_mutation = DurableMutationRecord(
                 action_id=action_id,
                 workflow_id=state.workflow_id,
-                step_name="mutation_execution",
+                step_name=self.step_name,
                 capability_name=self.capability.metadata.name,
                 canonical_args=canonical_args,
                 status=MutationStatus.FAILED,

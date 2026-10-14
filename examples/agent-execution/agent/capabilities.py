@@ -217,7 +217,7 @@ class UpdateCustomerNoteCapability(CapabilityPort):
         if not note.strip():
             return {"success": False, "error": "Note cannot be empty"}
 
-        ok = self.store.add_note(customer_id, note)
+        ok = self.store.add_note(customer_id, note, action_id=action_id)
         if not ok:
             return {"success": False, "error": f"Customer '{customer_id}' not found"}
         return {
@@ -280,7 +280,7 @@ class ApplyFeeCreditCapability(CapabilityPort):
             return {"success": False, "error": "Credit amount must be greater than zero"}
 
         try:
-            ok = self.store.apply_credit(customer_id, amount_cents, reason)
+            ok = self.store.apply_credit(customer_id, amount_cents, reason, action_id=action_id)
             if not ok:
                 return {"success": False, "error": f"Customer '{customer_id}' not found"}
 

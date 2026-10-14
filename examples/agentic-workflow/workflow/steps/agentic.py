@@ -4,14 +4,60 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Mapping, Optional
+from typing import Any
 
+from agent.schema import validate_value
 from contracts.agent import AgentActor, SideEffectLevel
 from contracts.workflow import StepExecutionStatus
 
 from ..state import RemediationProposal, RemediationType, StepOutcome, WorkflowState
 
 PROPOSAL_JSON_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
+
+PROPOSAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "proposal_type": {"type": "string", "enum": [t.value for t in RemediationType]},
+        "summary": {"type": "string", "minLength": 1},
+        "suggested_arguments": {"type": "object"},
+        "requires_approval": {"type": "boolean"},
+        "requires_human_approval": {"type": "boolean"},
+    },
+    "required": ["proposal_type", "summary", "suggested_arguments"],
+    "additionalProperties": False,
+}
+ARGUMENT_SCHEMAS = {
+    RemediationType.FEE_CREDIT: {
+        "type": "object",
+        "properties": {
+            "amount_cents": {"type": "integer", "minimum": 1},
+            "reason": {"type": "string", "minLength": 1},
+        },
+        "required": ["amount_cents", "reason"],
+        "additionalProperties": False,
+    },
+    RemediationType.CUSTOMER_NOTE: {
+        "type": "object",
+        "properties": {"note": {"type": "string", "minLength": 1}},
+        "required": ["note"],
+        "additionalProperties": False,
+    },
+    RemediationType.INFORMATIONAL: {"type": "object", "additionalProperties": False},
+    RemediationType.SECURITY_ESCALATION: {
+        "type": "object",
+        "properties": {"reason": {"type": "string", "minLength": 1}},
+        "additionalProperties": False,
+    },
+}
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate proposal field: {key}")
+        result[key] = value
+    return result
 
 
 class AgenticInvestigationStep:
@@ -41,73 +87,58 @@ class AgenticInvestigationStep:
                 )
 
     def _parse_proposal_from_answer(self, raw_text: str) -> RemediationProposal:
-        """Parse untrusted model text into a strongly typed RemediationProposal."""
-        # Attempt to parse JSON proposal block
+        """Validate one JSON proposal; prose never determines a business action."""
+        if not isinstance(raw_text, str):
+            raise TypeError("Agent final answer must be a string.")
         match = PROPOSAL_JSON_PATTERN.search(raw_text)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-                if isinstance(data, dict) and "proposal_type" in data:
-                    prop_type_str = str(data["proposal_type"]).lower()
-                    for t in RemediationType:
-                        if t.value == prop_type_str:
-                            return RemediationProposal(
-                                proposal_type=t,
-                                summary=str(data.get("summary", raw_text[:200])),
-                                suggested_arguments=dict(data.get("suggested_arguments", {})),
-                                requires_approval=bool(data.get("requires_approval", t == RemediationType.FEE_CREDIT)),
-                            )
-            except Exception:
-                pass
-
-        # Fallback text heuristic matching
-        lower_text = raw_text.lower()
-        if "frozen" in lower_text or "escalat" in lower_text or "security hold" in lower_text:
-            return RemediationProposal(
-                proposal_type=RemediationType.SECURITY_ESCALATION,
-                summary=raw_text[:200],
-                requires_approval=False,
-            )
-        elif "credit" in lower_text or "refund" in lower_text or "waive" in lower_text:
-            # Extract amount if present
-            amount_cents = 1500  # Default $15 concession heuristic
-            amount_match = re.search(r"\$?(\d+(?:\.\d{2})?)", raw_text)
-            if amount_match:
-                val = float(amount_match.group(1))
-                amount_cents = int(val * 100) if val < 100 else int(val)
-
-            return RemediationProposal(
-                proposal_type=RemediationType.FEE_CREDIT,
-                summary=raw_text[:200],
-                suggested_arguments={
-                    "amount_cents": min(amount_cents, 5000),
-                    "reason": "Customer billing dispute adjustment",
-                },
-                requires_approval=True,
-            )
-        elif "note" in lower_text:
-            return RemediationProposal(
-                proposal_type=RemediationType.CUSTOMER_NOTE,
-                summary=raw_text[:200],
-                suggested_arguments={"note": "Inquiry reviewed; operational note documented."},
-                requires_approval=False,
-            )
-
+        if not match:
+            raise ValueError("Completed investigation must contain a JSON proposal.")
+        data = json.loads(match.group(0), object_pairs_hook=_unique_json_object)
+        errors = validate_value(PROPOSAL_SCHEMA, data)
+        if errors:
+            raise ValueError("Invalid proposal: " + "; ".join(errors))
+        proposal_type = RemediationType(data["proposal_type"])
+        arguments = data["suggested_arguments"]
+        errors = validate_value(ARGUMENT_SCHEMAS[proposal_type], arguments)
+        if errors:
+            raise ValueError("Invalid proposal arguments: " + "; ".join(errors))
+        if not data["summary"].strip() or any(
+            isinstance(value, str) and not value.strip() for value in arguments.values()
+        ):
+            raise ValueError("Proposal text fields must not be blank.")
+        if (
+            "requires_approval" in data
+            and "requires_human_approval" in data
+            and data["requires_approval"] != data["requires_human_approval"]
+        ):
+            raise ValueError("Conflicting proposal approval flags.")
         return RemediationProposal(
-            proposal_type=RemediationType.INFORMATIONAL,
-            summary=raw_text,
-            requires_approval=False,
+            proposal_type=proposal_type,
+            summary=data["summary"],
+            suggested_arguments=arguments,
+            requires_approval=proposal_type == RemediationType.FEE_CREDIT,
         )
 
     async def execute(self, state: WorkflowState) -> StepOutcome:
         customer_id = state.domain_context.get("customer_id", "")
-        inquiry = state.domain_context.get("issue_description", "Customer billing inquiry")
+        inquiry = state.domain_context.get("inquiry")
+        if not isinstance(inquiry, str) or not inquiry.strip():
+            return StepOutcome(
+                status=StepExecutionStatus.FAILED,
+                outcome_type="invalid_input",
+                error_message="Required field 'inquiry' must be a non-empty string.",
+            )
 
         goal = (
             f"Investigate customer inquiry for '{customer_id}': {inquiry}. "
             "Inspect customer status, account balance, and dispute policies. "
             "Determine the appropriate remediation proposal: INFORMATIONAL, CUSTOMER_NOTE, "
-            "FEE_CREDIT, or SECURITY_ESCALATION."
+            "FEE_CREDIT, or SECURITY_ESCALATION. Return one JSON object with exactly "
+            "proposal_type (lowercase), summary (non-empty string), and suggested_arguments (object). "
+            "For fee_credit supply amount_cents (positive integer) and reason (non-empty string); "
+            "for customer_note supply note (non-empty string); for informational supply {}; "
+            "for security_escalation supply an optional reason. Do not include customer_id, "
+            "workflow routes, or execution commands in the proposal. The application controls approval."
         )
 
         actor = AgentActor(
@@ -129,15 +160,24 @@ class AgenticInvestigationStep:
                     "during read-only agentic investigation."
                 )
 
-        if getattr(result, "status", "") == "FAILED":
+        result_status = getattr(result, "status", "")
+        if result_status != "COMPLETED":
             return StepOutcome(
                 status=StepExecutionStatus.FAILED,
-                outcome_type="agent_failed",
-                error_message=getattr(result, "final_answer", "Agent execution failed."),
+                outcome_type="agent_failed" if result_status == "FAILED" else "agent_incomplete",
+                error_message=f"Investigation did not complete: {result_status!r}.",
                 receipts=tuple(execution_receipts),
             )
 
-        proposal = self._parse_proposal_from_answer(getattr(result, "final_answer", ""))
+        try:
+            proposal = self._parse_proposal_from_answer(getattr(result, "final_answer", ""))
+        except (ValueError, TypeError, RecursionError) as exc:
+            return StepOutcome(
+                status=StepExecutionStatus.FAILED,
+                outcome_type="invalid_proposal",
+                error_message=str(exc),
+                receipts=tuple(execution_receipts),
+            )
 
         return StepOutcome(
             status=StepExecutionStatus.SUCCEEDED,
